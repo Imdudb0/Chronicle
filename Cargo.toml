@@ -1,0 +1,26 @@
+[package]
+name = "chronicle"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Base de données in-memory déterministe : journal d'événements append-only (mmap), snapshots, time-travel."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/<toi>/chronicle"
+keywords = ["database", "event-sourcing", "mmap", "postcard", "deterministic"]
+categories = ["database-implementations"]
+
+[dependencies]
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+crc32fast = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
