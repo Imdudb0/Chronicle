@@ -1,0 +1,50 @@
+name: Run Chronicle
+
+on:
+  workflow_dispatch
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  OMP_NUM_THREADS: "1"
+  RAYON_NUM_THREADS: "2"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: cargo build --release
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+
+      - name: Run Chronicle application
+        run: RUST_BACKTRACE=full cargo run --releas
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+
+      - name: Run test
+        run: cargo test -- --nocapture
+
+      - name: Debug - Show files and Git status
+        if: always()
+        run: |
+          echo "=== Files in directories ==="
+          ls -la out/ || echo "Directory out/ not found!"
+          echo "=== Git Status (including ignored) ==="
+          git status --ignored
+
+      - name: Commit and Push changes
+        if: always()
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Résultats simulation: ${{ github.run_number }}"
+          file_pattern: 'out/'
+          add_options: '-f'
