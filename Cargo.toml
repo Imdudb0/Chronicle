@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Base de données in-memory déterministe : journal d'événements append-only (mmap), snapshots, time-travel."
 license = "MIT"
-repository = "https://github.com/<toi>/chronicle"
+repository = "https://github.com/imdudb0/chronicle"
 keywords = ["database", "event-sourcing", "mmap", "postcard", "deterministic"]
 categories = ["database-implementations"]
 
