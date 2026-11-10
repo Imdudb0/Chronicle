@@ -78,32 +78,49 @@ impl<S: StateMachine> Engine<S> {
     }
 
     /// Journalise l'événement, puis l'applique. Renvoie son cycle.
-    ///
-    /// On applique l'événement *décodé depuis les octets journalisés*, jamais
-    /// l'objet d'origine : chemin « live » et chemin de rejeu sont ainsi
-    /// identiques par construction.
     pub fn submit(&mut self, event: &S::Event) -> Result<u64> {
         let bytes = postcard::to_allocvec(event)?;
-        let decoded: S::Event = postcard::from_bytes(&bytes)?;
-        let seq = self.journal.append(&bytes)?;
-        self.state.apply(&decoded);
+        self.submit_encoded(&bytes)
+    }
+
+    /// Comme [`Engine::submit`], pour un événement déjà encodé en postcard
+    /// (la boucle d'événements laisse l'encodage au thread du client).
+    ///
+    /// On applique l'événement *décodé depuis les octets journalisés*, jamais
+    /// l'objet d'origine : chemin « live » et rejeu sont identiques. Le décodage
+    /// précède l'écriture : un message mal formé n'atteint jamais le journal
+    /// (il rendrait le rejeu impossible).
+    pub fn submit_encoded(&mut self, bytes: &[u8]) -> Result<u64> {
+        let (event, rest) = postcard::take_from_bytes::<S::Event>(bytes)?;
+        if !rest.is_empty() {
+            return Err(Error::TrailingBytes);
+        }
+        let seq = self.journal.append(bytes)?;
+        self.state.apply(&event);
         Ok(seq)
     }
 
-    /// Barrière de durabilité : tout ce qui a été soumis est sur disque au retour.
-    /// Écrit aussi un snapshot si `snapshot_every` cycles se sont écoulés depuis le
-    /// dernier.
-    ///
-    /// Idempotent : si le snapshot échoue (disque plein…), les événements sont
-    /// déjà durables et rappeler `commit` retente simplement le snapshot.
-    pub fn commit(&mut self) -> Result<()> {
-        self.journal.sync()?;
+    /// Barrière de durabilité du journal seul, sans snapshot.
+    pub fn sync(&mut self) -> Result<()> {
+        self.journal.sync()
+    }
+
+    /// Écrit un snapshot si `snapshot_every` cycles se sont écoulés depuis le dernier.
+    pub fn maybe_snapshot(&mut self) -> Result<()> {
         let every = self.opts.snapshot_every;
         let since = self.last_seq().saturating_sub(self.snapshots.latest().unwrap_or(0));
         if every != 0 && since >= every {
+            self.journal.sync()?; // un snapshot ne dépasse jamais le journal durable
             self.write_snapshot()?;
         }
         Ok(())
+    }
+
+    /// Barrière de durabilité + snapshot périodique. Idempotent : si le snapshot
+    /// échoue, les événements sont déjà durables et rappeler `commit` le retente.
+    pub fn commit(&mut self) -> Result<()> {
+        self.sync()?;
+        self.maybe_snapshot()
     }
 
     /// Force un snapshot maintenant (ex. avant un arrêt propre). Renvoie son cycle
