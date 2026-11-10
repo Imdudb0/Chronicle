@@ -11,6 +11,10 @@ pub enum Error {
     /// Un autre processus (ou handle) détient déjà le journal.
     Locked,
     SeqOutOfRange { requested: u64, last: u64 },
+    /// Événement encodé suivi d'octets en trop : rejeté avant journalisation.
+    TrailingBytes,
+    /// La boucle d'événements est arrêtée (ou s'est arrêtée avant de répondre).
+    Closed,
 }
 
 impl fmt::Display for Error {
@@ -22,7 +26,9 @@ impl fmt::Display for Error {
             Error::PayloadTooLarge(n) => write!(f, "payload too large: {n} bytes"),
             Error::Locked => write!(f, "journal is locked by another handle"),
             Error::SeqOutOfRange { requested, last } => {
-                write!(f, "cycle {requested} out of range (last = {last})")
+                write!(f, "cycle {requested} out of range (last = {last})"),
+            Error::TrailingBytes => write!(f, "trailing bytes after encoded event"),
+            Error::Closed => write!(f, "event loop is closed"),
             }
         }
     }
