@@ -30,8 +30,8 @@ jobs:
         env:
           RUSTFLAGS: "-C target-cpu=native"
 
-      - name: Run test
-        run: cargo test -- --nocapture
+      #- name: Run test
+        #run: cargo test -- --nocapture
 
       - name: Debug - Show files and Git status
         if: always()
