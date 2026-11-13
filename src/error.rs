@@ -26,10 +26,10 @@ impl fmt::Display for Error {
             Error::PayloadTooLarge(n) => write!(f, "payload too large: {n} bytes"),
             Error::Locked => write!(f, "journal is locked by another handle"),
             Error::SeqOutOfRange { requested, last } => {
-                write!(f, "cycle {requested} out of range (last = {last})"),
+                write!(f, "cycle {requested} out of range (last = {last})")
+            }
             Error::TrailingBytes => write!(f, "trailing bytes after encoded event"),
             Error::Closed => write!(f, "event loop is closed"),
-            }
         }
     }
 }
