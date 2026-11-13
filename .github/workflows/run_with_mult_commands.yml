@@ -1,0 +1,74 @@
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: cargo build --release
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+
+      - name: Run Chronicle application (m1.bin)
+        run: RUST_BACKTRACE=full cargo run --release -- train --out out/m1.bin --secs 1800
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+
+      # 0. sidecar de plage de m1.bin (T ≤ 6, q ≤ 3, k ≤ 4)
+      - name: Sidecar m1.bin.ref
+        run: |
+          mkdir -p out
+          printf '6 3 4' > out/m1.bin.ref
+
+      # 1. anatomie de m1.bin
+      - name: Diag m1.bin
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+        run: |
+          cargo run --release -- diag --model out/m1.bin
+          cargo run --release -- diag --model out/m1.bin --horizon 24
+
+      # 2. test de plomberie : A contre A doit donner A/B = 1,00 partout
+      - name: Plumbing check (A vs A)
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+        run: cargo run --release -- cmp --a out/m1.bin --b out/m1.bin
+
+      # 3. contrôle longueur : B = T ≤ 12, q ≤ 3   (≈ 5 min)
+      - name: Length control (T<=12, q<=3)
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+        run: |
+          cargo run --release -- train --thi 12 --qhi 3 --out out/m1_t12.bin
+          cargo run --release -- cmp --a out/m1.bin --b out/m1_t12.bin --axis len
+
+      # 4. contrôle profondeur : C = T ≤ 6, q ≤ 6   (≈ 4 min)
+      - name: Depth control (T<=6, q<=6)
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+        run: |
+          cargo run --release -- train --thi 6 --qhi 6 --out out/m1_q6.bin
+          cargo run --release -- cmp --a out/m1.bin --b out/m1_q6.bin --axis depth
+
+      # 5. fragment k ≤ 2, protocole d'origine (curriculum, portes 0,90 puis 0,95)
+      - name: Fragment k<=2
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+        run: cargo run --release -- train --kmax 2 --secs 2400 --out out/m2.bin
+
+      - name: Debug - Show files and Git status
+        if: always()
+        run: |
+          echo "=== Files in directories ==="
+          ls -la out/ || echo "Directory out/ not found!"
+          echo "=== Git Status (including ignored) ==="
+          git status --ignored
+
+      - name: Commit and Push changes
+        if: always()
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Résultats simulation: ${{ github.run_number }}"
+          file_pattern: 'out/'
+          add_options: '-f'
