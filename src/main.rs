@@ -155,7 +155,7 @@ fn cmd_train(a: &[String]) {
         n_gate: opt(a, "--ngate", 3000usize),
         secs: opt(a, "--secs", 0.0f64),
         from: opt(a, "--from", 1usize).saturating_sub(1),
-        out: opt(a, "--out", "m0d.bin".to_string()),
+        out: opt(a, "--out", "out/m0d.bin".to_string()),
         init: opt(a, "--init", String::new()),
     };
     let (net, stage) = train::train(&cfg);
@@ -165,7 +165,7 @@ fn cmd_train(a: &[String]) {
 }
 
 fn cmd_eval(a: &[String]) {
-    let path: String = opt(a, "--model", "m0d.bin".to_string());
+    let path: String = opt(a, "--model", "out/m0d.bin".to_string());
     let net = load_or_exit(&path);
     let stage = stage_of(a, &path);
     let v = eval::report(&net, &ecfg(a), stage);
@@ -173,7 +173,7 @@ fn cmd_eval(a: &[String]) {
 }
 
 fn cmd_diag(a: &[String]) {
-    let path: String = opt(a, "--model", "m0d.bin".to_string());
+    let path: String = opt(a, "--model", "out/m0d.bin".to_string());
     let net = load_or_exit(&path);
     let sts = train::stages(&Prior::demo());
     let stage = stage_of(a, &path);
