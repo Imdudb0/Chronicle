@@ -55,6 +55,7 @@ jobs:
 
       # 4. contrôle profondeur : C = T ≤ 6, q ≤ 6   (≈ 4 min)
       - name: Depth control (T<=6, q<=6)
+        if: always()
         env:
           RUSTFLAGS: "-C target-cpu=native"
         run: |
@@ -63,6 +64,7 @@ jobs:
 
       # 5. fragment k ≤ 2, protocole d'origine (curriculum, portes 0,90 puis 0,95)
       - name: Fragment k<=2
+        if: always()
         env:
           RUSTFLAGS: "-C target-cpu=native"
         run: cargo run --release -- train --kmax 2 --secs 2400 --out out/m2.bin
