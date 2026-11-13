@@ -26,7 +26,7 @@ jobs:
           RUSTFLAGS: "-C target-cpu=native"
 
       - name: Run Chronicle application
-        run: RUST_BACKTRACE=full cargo run --release
+        run: RUST_BACKTRACE=full cargo run --release -- selftest
         env:
           RUSTFLAGS: "-C target-cpu=native"
 
