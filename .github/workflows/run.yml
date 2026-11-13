@@ -26,7 +26,7 @@ jobs:
           RUSTFLAGS: "-C target-cpu=native"
 
       - name: Run Chronicle application
-        run: RUST_BACKTRACE=full cargo run --release -- eval --model out/m0d.bin --stage 1
+        run: RUST_BACKTRACE=full cargo run --release -- train --out out/m1.bin --secs 1800
         env:
           RUSTFLAGS: "-C target-cpu=native"
 
