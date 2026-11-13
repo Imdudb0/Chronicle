@@ -1,15 +1,15 @@
-// Entraînement de D : minibatchs parallèles (threads std), Adam, curriculum piloté par la fidélité.
+// Entraînement de D (v2) : minibatchs parallèles (threads std), Adam, curriculum piloté par la fidélité.
 //
 // • Les programmes d'entraînement excluent le sous-ensemble « non vu » (hash(C) mod 8 = 0), voisins mutés compris.
-// • Chaque fil a son Rng (fork du Rng principal), son Work et son tampon de gradient ; Net est partagé en lecture.
-//   Résultat déterministe pour (seed, nombre de fils).
-// • Curriculum : l'étage i borne T ≤ t_hi(i) et qmax ≤ q_hi(i). On monte d'un étage quand la fidélité
-//   (régénération exacte ∧ trace exacte) mesurée sur programmes non vus de l'étage atteint `up`.
-//   Pas d'avance forcée : un étage bloqué est un résultat (D ne sait pas juger plus profond).
-// • Le seuil `up` et la rampe sont des boutons du grand livre, au même titre que τ et les vues.
+// • lr en cycles cosinus DANS CHAQUE étage : crête → lr_min ; crête ×peak_decay à chaque cycle de plus.
+// • La porte se juge en FIN de cycle (lr minimal) sur n_gate mondes non vus NON TRIVIAUX (E non constant).
+//   Étage intermédiaire : fid ≥ up → on monte. Étage final : fid ≥ gate → on s'arrête.
+//   Après max_cycles cycles sans franchir la porte : étage BLOQUÉ, arrêt (pas d'avance forcée).
+// • Le dernier étage entraîné est écrit dans <out>.stage : l'évaluation mesure 1×/2×/4× par rapport à lui.
+// • Un Rng, un Work et un tampon de gradient par fil ; déterministe pour (seed, nombre de fils).
 #![allow(dead_code)]
 
-use crate::eval::{draw_world, in_part, validate, Agg, Part};
+use crate::eval::{draw_world, in_part, nontrivial, validate, Agg, Part};
 use crate::meta::{mutate_sample, Prior, Sample};
 use crate::net::{Adam, Net, Work};
 use crate::rng::Rng;
@@ -17,19 +17,26 @@ use std::time::Instant;
 
 pub struct Cfg {
     pub seed: u64,
-    pub steps: usize,
+    pub steps: usize,      // plafond global de pas
     pub batch: usize,
     pub threads: usize,
-    pub lr: f64,
+    pub lr: f64,           // crête du premier cycle de chaque étage
+    pub lr_min: f64,       // lr en fin de cycle
+    pub cycle: usize,      // pas par cycle
+    pub max_cycles: usize, // cycles max par étage avant « bloqué »
+    pub peak_decay: f64,   // crête × peak_decay à chaque cycle de plus dans un même étage
     pub clip: f64,
     pub w_trace: f64,
-    pub mut_frac: f64, // part du lot formée de voisins mutés
-    pub up: f64,       // fid(val) pour monter d'un étage
-    pub every: usize,  // pas entre deux validations
-    pub n_val: usize,
-    pub secs: f64,     // plafond de temps (0 = aucun)
+    pub mut_frac: f64,
+    pub up: f64,           // porte des étages intermédiaires
+    pub gate: f64,         // porte de l'étage final (= seuil du verdict)
+    pub every: usize,      // pas entre deux validations de suivi
+    pub n_val: usize,      // taille de la validation de suivi
+    pub n_gate: usize,     // taille de la validation de porte (fin de cycle)
+    pub secs: f64,         // plafond de temps (0 = aucun)
+    pub from: usize,       // étage de départ (0-based)
     pub out: String,
-    pub init: String,  // poids initiaux ("" = aucun)
+    pub init: String,
 }
 
 /// Rampe de budgets : (T ≤ 6, q ≤ 3) → … → prior final.
@@ -49,6 +56,21 @@ pub fn stages(fin: &Prior) -> Vec<Prior> {
         .collect()
 }
 
+pub fn save_stage(path: &str, stage: usize) {
+    let _ = std::fs::write(format!("{}.stage", path), stage.to_string());
+}
+
+pub fn load_stage(path: &str) -> Option<usize> {
+    std::fs::read_to_string(format!("{}.stage", path)).ok()?.trim().parse().ok()
+}
+
+fn checkpoint(net: &Net, out: &str, stage: usize) {
+    if let Err(e) = net.save(out) {
+        eprintln!("sauvegarde impossible ({}) : {}", out, e);
+    }
+    save_stage(out, stage);
+}
+
 /// Un échantillon d'entraînement : monde propre, ou voisin muté avec probabilité mut_frac. Jamais « non vu ».
 pub fn draw_train(rng: &mut Rng, pr: &Prior, mut_frac: f64) -> Sample {
     let par = draw_world(rng, pr, Part::Train, 1_000_000).expect("prior d'entraînement vide");
@@ -62,7 +84,6 @@ pub fn draw_train(rng: &mut Rng, pr: &Prior, mut_frac: f64) -> Sample {
     par
 }
 
-/// Un fil de calcul : son flux aléatoire, son espace de travail, son tampon de gradient.
 struct Worker {
     rng: Rng,
     ws: Work,
@@ -74,6 +95,7 @@ impl Worker {
         Worker { rng, ws: Work::new(), g: vec![0.0; np] }
     }
 
+    /// Gradient sommé sur n échantillons (triviaux inclus). Les statistiques ne comptent que les non triviaux.
     fn run(&mut self, net: &Net, pr: &Prior, n: usize, mut_frac: f64, w_trace: f64) -> Agg {
         for x in self.g.iter_mut() {
             *x = 0.0;
@@ -82,15 +104,19 @@ impl Worker {
         for _ in 0..n {
             let s = draw_train(&mut self.rng, pr, mut_frac);
             let st = net.run_sample(&s, w_trace, &mut self.ws, Some(&mut self.g[..]));
-            a.add(&s, &st);
+            if nontrivial(&s) {
+                a.add(&s, &st);
+            }
         }
         a
     }
 }
 
-pub fn train(cfg: &Cfg) -> Net {
+/// Renvoie (réseau, dernier étage entraîné, 0-based).
+pub fn train(cfg: &Cfg) -> (Net, usize) {
     let fin = Prior::demo();
     let sts = stages(&fin);
+    let nst = sts.len();
     let mut rng = Rng::new(cfg.seed);
     let mut net = Net::new(&mut rng);
     if !cfg.init.is_empty() {
@@ -112,43 +138,32 @@ pub fn train(cfg: &Cfg) -> Net {
     let mut vws = Work::new();
     let mut adam = Adam::new(np);
     let mut g = vec![0.0f64; np];
-    println!(
-        "entraînement de D : {} paramètres, {} fil(s), lot {}, {} étages, voisins mutés {:.2}, lr {:.1e}, {} pas max{}",
-        np,
-        nth,
-        cfg.batch,
-        sts.len(),
-        cfg.mut_frac,
-        cfg.lr,
-        cfg.steps,
-        if cfg.secs > 0.0 { format!(", {:.0} s max", cfg.secs) } else { String::new() }
-    );
-    println!("étage 1/{} : T ≤ {}, qmax ≤ {}", sts.len(), sts[0].t_hi, sts[0].q_hi);
-
+    let cycle = cfg.cycle.max(1);
     let every = cfg.every.max(1);
+    let mut stage = cfg.from.min(nst - 1);
+    println!(
+        "entraînement de D (v2) : {} paramètres, {} fil(s), lot {}, {} étages, départ étage {}, mutés {:.2}",
+        np, nth, cfg.batch, nst, stage + 1, cfg.mut_frac
+    );
+    println!(
+        "lr {:.1e} → {:.1e} par cycle de {} pas (crête ×{:.2} par cycle de plus), ≤ {} cycles/étage ; portes : up {:.0}% / final {:.0}% (fid sur mondes non triviaux non vus, n = {})",
+        cfg.lr, cfg.lr_min, cycle, cfg.peak_decay, cfg.max_cycles, 100.0 * cfg.up, 100.0 * cfg.gate, cfg.n_gate
+    );
+    println!("étage {}/{} : T ≤ {}, qmax ≤ {}", stage + 1, nst, sts[stage].t_hi, sts[stage].q_hi);
+
     let clock = Instant::now();
-    let mut stage = 0usize;
-    // (pas, temps) d'entrée dans l'étage final : le lr ne décroît qu'à partir de là
-    let mut final_at: Option<(usize, f64)> = if sts.len() == 1 { Some((0, 0.0)) } else { None };
+    let (mut cyc, mut k, mut step, mut done) = (0usize, 0usize, 0usize, 0usize);
     let mut win = Agg::default();
     let (mut gsum, mut gcnt, mut bad) = (0.0f64, 0usize, 0usize);
-    let mut done = 0usize;
+    let mut why = "plafond de pas";
+    let mut last_stage = stage;
 
-    for step in 1..=cfg.steps {
+    while step < cfg.steps {
         let pr = &sts[stage];
-        let lr = match final_at {
-            None => cfg.lr,
-            Some((s0, t0)) => {
-                let fs = (step - s0) as f64 / cfg.steps.saturating_sub(s0).max(1) as f64;
-                let ft = if cfg.secs > 0.0 {
-                    (clock.elapsed().as_secs_f64() - t0) / (cfg.secs - t0).max(1.0)
-                } else {
-                    0.0
-                };
-                let f = fs.max(ft).clamp(0.0, 1.0);
-                cfg.lr * (0.1 + 0.45 * (1.0 + (std::f64::consts::PI * f).cos()))
-            }
-        };
+        last_stage = stage;
+        let peak = (cfg.lr * cfg.peak_decay.powi(cyc as i32)).max(cfg.lr_min);
+        let lr = cfg.lr_min
+            + 0.5 * (peak - cfg.lr_min) * (1.0 + (std::f64::consts::PI * k as f64 / cycle as f64).cos());
 
         let (base, extra) = (cfg.batch / nth, cfg.batch % nth);
         let mut aggs: Vec<Agg> = Vec::with_capacity(nth);
@@ -183,29 +198,34 @@ pub fn train(cfg: &Cfg) -> Net {
         } else {
             bad += 1;
         }
-        let mut tot = Agg::default();
         for a in &aggs {
-            tot.merge(a);
+            win.merge(a);
         }
-        done += tot.n;
-        win.merge(&tot);
+        done += cfg.batch;
+        step += 1;
+        k += 1;
 
         let timeout = cfg.secs > 0.0 && clock.elapsed().as_secs_f64() >= cfg.secs;
-        if step % every == 0 || step == cfg.steps || timeout {
-            let v = validate(&net, pr, cfg.n_val, &mut vrng, &mut vws);
+        let cyc_end = k >= cycle;
+        if step % every == 0 || cyc_end || timeout {
+            let nv = if cyc_end { cfg.n_gate } else { cfg.n_val };
+            let v = validate(&net, pr, nv, &mut vrng, &mut vws);
             let el = clock.elapsed().as_secs_f64();
             println!(
-                "pas {:>6}  étage {}/{} (T≤{}, q≤{})  lr {:.1e}  L {:.4}  fid(train) {:>5.1}%  fid(val) {:>5.1}% ±{:.1}  |g| {:.3}  {:.0} éch/s  {:.0} s",
+                "pas {:>6}  étage {}/{} (T≤{}, q≤{})  cycle {}/{}  lr {:.1e}  L {:.4}  train {:>5.1}%  val {:>5.1}% ±{:.1}{}  |g| {:.3}  {:.0} éch/s  {:.0} s",
                 step,
                 stage + 1,
-                sts.len(),
+                nst,
                 pr.t_hi,
                 pr.q_hi,
+                cyc + 1,
+                cfg.max_cycles,
                 lr,
                 win.mean_loss(),
                 100.0 * win.fid(),
                 100.0 * v.fid(),
                 100.0 * v.ci(),
+                if cyc_end { " [porte]" } else { "" },
                 gsum / gcnt.max(1) as f64,
                 done as f64 / el.max(1e-9),
                 el
@@ -217,36 +237,59 @@ pub fn train(cfg: &Cfg) -> Net {
             gsum = 0.0;
             gcnt = 0;
             bad = 0;
-            if let Err(e) = net.save(&cfg.out) {
-                eprintln!("sauvegarde impossible ({}) : {}", cfg.out, e);
-            }
-            if v.fid() >= cfg.up && stage + 1 < sts.len() {
-                stage += 1;
-                println!(
-                    "  ↑ étage {}/{} : T ≤ {}, qmax ≤ {}   (fid(val) {:.1}% ≥ {:.0}%)",
-                    stage + 1,
-                    sts.len(),
-                    sts[stage].t_hi,
-                    sts[stage].q_hi,
-                    100.0 * v.fid(),
-                    100.0 * cfg.up
-                );
-                if stage + 1 == sts.len() {
-                    final_at = Some((step, clock.elapsed().as_secs_f64()));
+            checkpoint(&net, &cfg.out, stage);
+            if cyc_end {
+                let is_final = stage + 1 == nst;
+                let thr = if is_final { cfg.gate } else { cfg.up };
+                if v.fid() >= thr {
+                    if is_final {
+                        why = "étage final maîtrisé";
+                        break;
+                    }
+                    println!(
+                        "  ↑ porte franchie ({:.1}% ≥ {:.0}%) → étage {}/{} : T ≤ {}, qmax ≤ {}",
+                        100.0 * v.fid(),
+                        100.0 * thr,
+                        stage + 2,
+                        nst,
+                        sts[stage + 1].t_hi,
+                        sts[stage + 1].q_hi
+                    );
+                    stage += 1;
+                    cyc = 0;
+                } else {
+                    cyc += 1;
+                    println!(
+                        "  ✗ porte close ({:.1}% < {:.0}%) : {} cycle(s) sur {} dans l'étage {}/{}",
+                        100.0 * v.fid(),
+                        100.0 * thr,
+                        cyc,
+                        cfg.max_cycles,
+                        stage + 1,
+                        nst
+                    );
+                    if cyc >= cfg.max_cycles {
+                        why = "étage BLOQUÉ (porte jamais franchie)";
+                        break;
+                    }
                 }
+                k = 0;
             }
             if timeout {
-                println!("plafond de temps atteint");
+                why = "plafond de temps";
                 break;
             }
         }
     }
+    checkpoint(&net, &cfg.out, last_stage);
     println!(
-        "fin de l'entraînement : étage {}/{} atteint, {} échantillons, {:.0} s",
-        stage + 1,
-        sts.len(),
+        "fin : {} — dernier étage entraîné {}/{} ; {} pas, {} échantillons, {:.0} s",
+        why,
+        last_stage + 1,
+        nst,
+        step,
         done,
         clock.elapsed().as_secs_f64()
     );
-    net
+    (net, last_stage)
 }
