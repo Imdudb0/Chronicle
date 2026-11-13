@@ -1,6 +1,8 @@
 mod meta;
 mod rng;
 mod net;
+mod eval;
+mod train;
 
 use meta::*;
 use rng::Rng;
@@ -94,6 +96,59 @@ fn arg<T: std::str::FromStr>(a: &[String], i: usize, d: T) -> T {
     a.get(i).and_then(|s| s.parse::<T>().ok()).unwrap_or(d)
 }
 
+fn opt<T: std::str::FromStr>(a: &[String], key: &str, d: T) -> T {
+    a.windows(2)
+        .find(|w| w[0] == key)
+        .and_then(|w| w[1].parse::<T>().ok())
+        .unwrap_or(d)
+}
+
+fn ecfg(a: &[String]) -> eval::ECfg {
+    eval::ECfg {
+        n: opt(a, "--n", 2000usize),
+        secs: opt(a, "--esecs", 120.0f64),
+        seed: opt(a, "--eseed", 9001u64),
+        gate: opt(a, "--gate", 0.95f64),
+    }
+}
+
+fn cmd_train(a: &[String]) {
+    let threads_def = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cfg = train::Cfg {
+        seed: opt(a, "--seed", 1u64),
+        steps: opt(a, "--steps", 30_000usize),
+        batch: opt(a, "--batch", 64usize),
+        threads: opt(a, "--threads", threads_def),
+        lr: opt(a, "--lr", 2e-3f64),
+        clip: opt(a, "--clip", 1.0f64),
+        w_trace: opt(a, "--wtrace", 1.0f64),
+        mut_frac: opt(a, "--mut", 0.25f64),
+        up: opt(a, "--up", 0.90f64),
+        every: opt(a, "--every", 250usize),
+        n_val: opt(a, "--nval", 400usize),
+        secs: opt(a, "--secs", 0.0f64),
+        out: opt(a, "--out", "m0d.bin".to_string()),
+        init: opt(a, "--init", String::new()),
+    };
+    let net = train::train(&cfg);
+    println!("modèle : {}\n", cfg.out);
+    let v = eval::report(&net, &ecfg(a));
+    std::process::exit(v.code());
+}
+
+fn cmd_eval(a: &[String]) {
+    let path: String = opt(a, "--model", "m0d.bin".to_string());
+    let net = match net::Net::load(&path) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("{} : {}", path, e);
+            std::process::exit(1);
+        }
+    };
+    let v = eval::report(&net, &ecfg(a));
+    std::process::exit(v.code());
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
@@ -105,6 +160,11 @@ fn main() {
             }
         }
         Some("overfit") => net::overfit(arg(&args, 2, 1u64)),
-        _ => eprintln!("usage : selftest | monde [seed] [n] | gradcheck [seed] | overfit [seed]"),
+        Some("check") => eval::selfcheck(),
+        Some("train") => cmd_train(&args[2..]),
+        Some("eval") => cmd_eval(&args[2..]),
+        _ => eprintln!(
+            "usage : selftest | monde [seed] [n] | gradcheck [seed] | overfit [seed] | check | train [--opts] | eval [--opts]"
+        ),
     }
 }
