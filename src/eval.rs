@@ -391,10 +391,7 @@ fn row(label: &str, a: &Agg) {
     );
 }
 
-pub fn report(net: &Net, ec: &ECfg, stage: usize) -> Verdict {
-    let sts = crate::train::stages(&Prior::demo());
-    let stage = stage.min(sts.len() - 1);
-    let pr = sts[stage].clone();
+pub fn report(net: &Net, ec: &ECfg, pr: &Prior) -> Verdict {
     let mults = [1usize, 2, 4];
     let mut ws = Work::new();
     println!(
@@ -402,29 +399,25 @@ pub fn report(net: &Net, ec: &ECfg, stage: usize) -> Verdict {
         HELD_MOD
     );
     println!(
-        "référence = étage d'entraînement {}/{} : T ∈ [{}, {}], qmax ≤ {} (1× = cette plage) | fid = régénération exacte ∧ trace exacte | ± = IC 95 % | div = 1,00 par construction",
-        stage + 1,
-        sts.len(),
-        pr.t_lo,
-        pr.t_hi,
-        pr.q_hi
+        "référence (1×) : T ∈ [{}, {}], qmax ≤ {}, k ≤ {} | fid = régénération exacte ∧ trace exacte | ± = IC 95 %",
+        pr.t_lo, pr.t_hi, pr.q_hi, pr.k_max
     );
 
-    let al = axis_len(net, &pr, &mults, ec, &mut ws);
+    let al = axis_len(net, pr, &mults, ec, &mut ws);
     println!("\nAXE LONGUEUR : mêmes programmes et mêmes vues, qmax ≤ {} jusqu'à {}×", pr.q_hi, mults[2]);
     head();
     for (i, a) in al.iter().enumerate() {
         row(&format!("{}×  T={}", mults[i], mults[i] * pr.t_hi), a);
     }
 
-    let ad = axis_depth(net, &pr, &mults, ec, &mut ws);
+    let ad = axis_depth(net, pr, &mults, ec, &mut ws);
     println!("\nAXE PROFONDEUR : même plage de T [{}, {}], bins de qmax ×1 / ×2 / ×4 de {}", pr.t_lo, pr.t_hi, pr.q_hi);
     head();
     for (i, b) in ad.iter().enumerate() {
         row(&format!("{}×  q∈[{},{}]", mults[i], b.0, b.1), &b.2);
     }
 
-    let to = totality(net, &pr, ec, &mut ws);
+    let to = totality(net, pr, ec, &mut ws);
     println!("\nTOTALITÉ : voisins mutés (do local) de programmes non vus, même prior");
     head();
     row("mutés", &to);
@@ -453,6 +446,83 @@ pub fn report(net: &Net, ec: &ECfg, stage: usize) -> Verdict {
     show("profondeur", [ad[0].2.fid(), ad[1].2.fid(), ad[2].2.fid()], vd);
     println!("GLOBAL : {}", v.name());
     println!("{}", v.advice());
+    v
+}
+
+/// Contrôle de plage d'entraînement. A = modèle entraîné sur la plage de référence `pr` ; B = modèle entraîné
+/// plus large (plus long en T pour l'axe longueur, plus profond en qmax pour l'axe profondeur).
+/// Mêmes mondes non vus, mêmes vues (mêmes graines). Rétention au point 2× = fid(A) / fid(B) : ce que A conserve
+/// de ce qu'un modèle de même taille, entraîné jusqu'à ce point, sait faire. La difficulté est soustraite.
+pub fn compare(a: &Net, b: &Net, pr: &Prior, ec: &ECfg, depth: bool, rgate: f64) -> Verdict {
+    let mults = [1usize, 2, 4];
+    let mut ws = Work::new();
+    let mut rows: Vec<(String, Agg, Agg)> = Vec::new();
+    if depth {
+        let da = axis_depth(a, pr, &mults, ec, &mut ws);
+        let db = axis_depth(b, pr, &mults, ec, &mut ws);
+        for (i, (x, y)) in da.into_iter().zip(db.into_iter()).enumerate() {
+            rows.push((format!("{}×  q∈[{},{}]", mults[i], x.0, x.1), x.2, y.2));
+        }
+    } else {
+        let la = axis_len(a, pr, &mults, ec, &mut ws);
+        let lb = axis_len(b, pr, &mults, ec, &mut ws);
+        for (i, (x, y)) in la.into_iter().zip(lb.into_iter()).enumerate() {
+            rows.push((format!("{}×  T={}", mults[i], mults[i] * pr.t_hi), x, y));
+        }
+    }
+    println!("=== M0 / contrôle de plage d'entraînement : A (plage de référence) contre B (entraîné plus large) ===");
+    println!(
+        "référence : T ∈ [{}, {}], qmax ≤ {}, k ≤ {} | axe {} | mêmes mondes non vus pour A et B | A/B = rétention de A",
+        pr.t_lo,
+        pr.t_hi,
+        pr.q_hi,
+        pr.k_max,
+        if depth { "profondeur" } else { "longueur" }
+    );
+    println!(
+        "{:<15}{:>6}{:>9}{:>6}{:>9}{:>6}{:>9}{:>8}",
+        "point", "n", "A fid%", "±", "B fid%", "±", "B−A", "A/B"
+    );
+    for (label, x, y) in &rows {
+        println!(
+            "{:<15}{:>6}{:>9.1}{:>6.1}{:>9.1}{:>6.1}{:>9.1}{:>8.2}",
+            label,
+            x.n.min(y.n),
+            100.0 * x.fid(),
+            100.0 * x.ci(),
+            100.0 * y.fid(),
+            100.0 * y.ci(),
+            100.0 * (y.fid() - x.fid()),
+            x.fid() / y.fid().max(1e-9)
+        );
+    }
+    let (_, x, y) = &rows[1];
+    let ratio = x.fid() / y.fid().max(1e-9);
+    let v = if x.n < MIN_N || y.n < MIN_N || y.fid() < rgate {
+        Verdict::Inconclusive
+    } else if ratio >= 0.8 {
+        Verdict::Pass
+    } else if ratio < 0.5 {
+        Verdict::Kill
+    } else {
+        Verdict::Gray
+    };
+    println!(
+        "\nrègle (fixée avant mesure) : rétention A/B au point 2× ≥ 0,80 → PASS ; < 0,50 → KILL ; entre les deux → GRIS ; INCONCLUSIF si fid(B) au point 2× < {:.2} ou n < {}",
+        rgate, MIN_N
+    );
+    println!(
+        "point 2× : A {:.1} %   B {:.1} %   A/B = {:.2}   →   {}",
+        100.0 * x.fid(),
+        100.0 * y.fid(),
+        ratio,
+        v.name()
+    );
+    if depth {
+        println!("réserve : B répartit sa capacité sur plus de programmes que A, donc A/B surestime la rétention de A (lire un PASS avec prudence).");
+    } else {
+        println!("lecture : mêmes programmes, B voit seulement des ticks de plus ; si A/B ≈ 1, la chute de A à 2× est celle qu'un modèle entraîné à 2× subit aussi (capacité, pas plage).");
+    }
     v
 }
 
