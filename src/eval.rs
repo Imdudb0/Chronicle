@@ -445,6 +445,11 @@ pub fn report(net: &Net, ec: &ECfg, pr: &Prior) -> Verdict {
     show("longueur", [al[0].fid(), al[1].fid(), al[2].fid()], vl);
     show("profondeur", [ad[0].2.fid(), ad[1].2.fid(), ad[2].2.fid()], vd);
     println!("GLOBAL : {}", v.name());
+    println!(
+        "sous réserve de la porte (fid 1× ignorée ; à lire avec les ± ci-dessus) : longueur {} ; profondeur {}",
+        judge(&al[0], &al[1], 0.0).name(),
+        judge(&ad[0].2, &ad[1].2, 0.0).name()
+    );
     println!("{}", v.advice());
     v
 }
