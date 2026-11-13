@@ -123,18 +123,28 @@ fn load_or_exit(path: &str) -> net::Net {
     }
 }
 
-/// Étage de référence (0-based) : --stage N (1-based), sinon <modèle>.stage, sinon étage final.
-fn stage_of(a: &[String], path: &str) -> usize {
-    let nst = train::stages(&Prior::demo()).len();
-    let s: usize = opt(a, "--stage", 0usize);
-    if s >= 1 {
-        return (s - 1).min(nst - 1);
+/// Plage de référence (1×) : --thi / --qhi / --kmax si donnés, sinon <modèle>.ref, sinon le prior final.
+fn ref_prior(a: &[String], path: &str) -> Prior {
+    let mut p = Prior::demo();
+    if let Some((t, q, k)) = train::load_ref(path) {
+        p.t_hi = t;
+        p.q_hi = q;
+        p.k_max = k;
     }
-    train::load_stage(path).unwrap_or(nst - 1).min(nst - 1)
+    p.t_hi = opt(a, "--thi", p.t_hi);
+    p.q_hi = opt(a, "--qhi", p.q_hi);
+    p.k_max = opt(a, "--kmax", p.k_max).clamp(1, K_MAX);
+    p
 }
 
 fn cmd_train(a: &[String]) {
     let threads_def = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let d = Prior::demo();
+    let fixed = if a.iter().any(|x| x.as_str() == "--thi" || x.as_str() == "--qhi") {
+        Some((opt(a, "--thi", d.t_hi), opt(a, "--qhi", d.q_hi)))
+    } else {
+        None
+    };
     let cfg = train::Cfg {
         seed: opt(a, "--seed", 1u64),
         steps: opt(a, "--steps", 400_000usize),
@@ -155,48 +165,21 @@ fn cmd_train(a: &[String]) {
         n_gate: opt(a, "--ngate", 3000usize),
         secs: opt(a, "--secs", 0.0f64),
         from: opt(a, "--from", 1usize).saturating_sub(1),
-        out: opt(a, "--out", "out/m0d.bin".to_string()),
+        kmax: opt(a, "--kmax", d.k_max).clamp(1, K_MAX),
+        fixed,
+        out: opt(a, "--out", "m0d.bin".to_string()),
         init: opt(a, "--init", String::new()),
     };
-    let (net, stage) = train::train(&cfg);
-    println!("modèle : {} (étage de référence {})\n", cfg.out, stage + 1);
-    let v = eval::report(&net, &ecfg(a), stage);
+    let (net, pr) = train::train(&cfg);
+    println!("modèle : {} (plage : T ≤ {}, qmax ≤ {}, k ≤ {})\n", cfg.out, pr.t_hi, pr.q_hi, pr.k_max);
+    let v = eval::report(&net, &ecfg(a), &pr);
     std::process::exit(v.code());
 }
 
 fn cmd_eval(a: &[String]) {
-    let path: String = opt(a, "--model", "out/m0d.bin".to_string());
+    let path: String = opt(a, "--model", "m0d.bin".to_string());
     let net = load_or_exit(&path);
-    let stage = stage_of(a, &path);
-    let v = eval::report(&net, &ecfg(a), stage);
+    let pr = ref_prior(a, &path);
+    let v = eval::report(&net, &ecfg(a), &pr);
     std::process::exit(v.code());
-}
-
-fn cmd_diag(a: &[String]) {
-    let path: String = opt(a, "--model", "out/m0d.bin".to_string());
-    let net = load_or_exit(&path);
-    let sts = train::stages(&Prior::demo());
-    let stage = stage_of(a, &path);
-    diag::run(&net, &sts[stage], opt(a, "--n", 4000usize), opt(a, "--eseed", 9001u64), opt(a, "--horizon", 0usize));
-}
-
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(|s| s.as_str()) {
-        Some("selftest") => selftest(),
-        Some("monde") => monde(&args[2..]),
-        Some("gradcheck") => {
-            if !net::gradcheck(arg(&args, 2, 1u64)) {
-                std::process::exit(1);
-            }
-        }
-        Some("overfit") => net::overfit(arg(&args, 2, 1u64)),
-        Some("check") => eval::selfcheck(),
-        Some("train") => cmd_train(&args[2..]),
-        Some("eval") => cmd_eval(&args[2..]),
-        Some("diag") => cmd_diag(&args[2..]),
-        _ => eprintln!(
-            "usage : selftest | monde [seed] [n] | gradcheck [seed] | overfit [seed] | check | train [--opts] | eval [--opts] | diag [--opts]"
-        ),
-    }
 }
