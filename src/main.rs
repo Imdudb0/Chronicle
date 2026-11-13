@@ -4,6 +4,7 @@ mod net;
 mod eval;
 mod train;
 mod diag;
+mod sizes;
 
 use meta::*;
 use rng::Rng;
@@ -224,6 +225,20 @@ fn cmd_cmp(a: &[String]) {
     std::process::exit(v.code());
 }
 
+/// Taille de file contre erreurs de D (lecture seule). La file d'entraînement vient de <modèle>.ref
+/// (--qtrain pour forcer) ; par défaut T de l'entraînement et file jusqu'à 4× celle de l'entraînement.
+fn cmd_sizes(a: &[String]) {
+    let path: String = opt(a, "--model", "out/m2.bin".to_string());
+    let net = load_or_exit(&path);
+    let d = Prior::demo();
+    let (t, q, k) = train::load_ref(&path).unwrap_or((d.t_hi, d.q_hi, d.k_max));
+    let mut pr = d;
+    pr.t_hi = opt(a, "--thi", t);
+    pr.k_max = opt(a, "--kmax", k).clamp(1, K_MAX);
+    pr.q_hi = opt(a, "--qhi", 4 * q);
+    sizes::run(&net, &pr, opt(a, "--qtrain", q), opt(a, "--n", 6000usize), opt(a, "--eseed", 9001u64));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
@@ -240,8 +255,9 @@ fn main() {
         Some("eval") => cmd_eval(&args[2..]),
         Some("diag") => cmd_diag(&args[2..]),
         Some("cmp") => cmd_cmp(&args[2..]),
+        Some("sizes") => cmd_sizes(&args[2..]),
         _ => eprintln!(
-            "usage : selftest | monde [seed] [n] | gradcheck [seed] | overfit [seed] | check | train [--opts] | eval [--opts] | diag [--opts] | cmp [--opts]"
+            "usage : selftest | monde [seed] [n] | gradcheck [seed] | overfit [seed] | check | train [--opts] | eval [--opts] | diag [--opts] | cmp [--opts] | sizes [--opts]"
         ),
     }
 }
