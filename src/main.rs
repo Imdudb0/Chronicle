@@ -183,3 +183,65 @@ fn cmd_eval(a: &[String]) {
     let v = eval::report(&net, &ecfg(a), &pr);
     std::process::exit(v.code());
 }
+
+fn cmd_diag(a: &[String]) {
+    let path: String = opt(a, "--model", "m0d.bin".to_string());
+    let net = load_or_exit(&path);
+    let pr = ref_prior(a, &path);
+    diag::run(
+        &net,
+        &pr,
+        opt(a, "--n", 4000usize),
+        opt(a, "--eseed", 9001u64),
+        opt(a, "--horizon", 0usize),
+    );
+}
+
+/// Contrôle de plage d'entraînement : A (plage de référence, lue dans <A>.ref) contre B (entraîné plus large).
+/// --axis len (défaut) : B entraîné à T plus long ; --axis depth : B entraîné à qmax plus profond.
+fn cmd_cmp(a: &[String]) {
+    let pa: String = opt(a, "--a", "out/m1.bin".to_string());
+    let pb: String = opt(a, "--b", "out/m1_t12.bin".to_string());
+    let depth = opt(a, "--axis", "len".to_string()) == "depth";
+    let rgate: f64 = opt(a, "--rgate", 0.30f64);
+    let na = load_or_exit(&pa);
+    let nb = load_or_exit(&pb);
+    let pr = ref_prior(a, &pa);
+    println!("A : {} (plage T ≤ {}, qmax ≤ {}, k ≤ {})", pa, pr.t_hi, pr.q_hi, pr.k_max);
+    match train::load_ref(&pb) {
+        Some((t, q, k)) => {
+            println!("B : {} (plage T ≤ {}, qmax ≤ {}, k ≤ {})", pb, t, q, k);
+            let wider = if depth { q > pr.q_hi } else { t > pr.t_hi };
+            if !wider || k != pr.k_max {
+                eprintln!(
+                    "attention : B doit être plus large que A sur l'axe testé, à même k_max ; sinon le contrôle ne mesure rien"
+                );
+            }
+        }
+        None => eprintln!("attention : {}.ref absent, plage de B inconnue", pb),
+    }
+    let v = eval::compare(&na, &nb, &pr, &ecfg(a), depth, rgate);
+    std::process::exit(v.code());
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("selftest") => selftest(),
+        Some("monde") => monde(&args[2..]),
+        Some("gradcheck") => {
+            if !net::gradcheck(arg(&args, 2, 1u64)) {
+                std::process::exit(1);
+            }
+        }
+        Some("overfit") => net::overfit(arg(&args, 2, 1u64)),
+        Some("check") => eval::selfcheck(),
+        Some("train") => cmd_train(&args[2..]),
+        Some("eval") => cmd_eval(&args[2..]),
+        Some("diag") => cmd_diag(&args[2..]),
+        Some("cmp") => cmd_cmp(&args[2..]),
+        _ => eprintln!(
+            "usage : selftest | monde [seed] [n] | gradcheck [seed] | overfit [seed] | check | train [--opts] | eval [--opts] | diag [--opts] | cmp [--opts]"
+        ),
+    }
+}
