@@ -112,41 +112,71 @@ fn ecfg(a: &[String]) -> eval::ECfg {
     }
 }
 
-fn cmd_train(a: &[String]) {
-    let threads_def = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    let cfg = train::Cfg {
-        seed: opt(a, "--seed", 1u64),
-        steps: opt(a, "--steps", 30_000usize),
-        batch: opt(a, "--batch", 64usize),
-        threads: opt(a, "--threads", threads_def),
-        lr: opt(a, "--lr", 2e-3f64),
-        clip: opt(a, "--clip", 1.0f64),
-        w_trace: opt(a, "--wtrace", 1.0f64),
-        mut_frac: opt(a, "--mut", 0.25f64),
-        up: opt(a, "--up", 0.90f64),
-        every: opt(a, "--every", 250usize),
-        n_val: opt(a, "--nval", 400usize),
-        secs: opt(a, "--secs", 0.0f64),
-        out: opt(a, "--out", "out/m0d.bin".to_string()),
-        init: opt(a, "--init", String::new()),
-    };
-    let net = train::train(&cfg);
-    println!("modèle : {}\n", cfg.out);
-    let v = eval::report(&net, &ecfg(a));
-    std::process::exit(v.code());
-}
-
-fn cmd_eval(a: &[String]) {
-    let path: String = opt(a, "--model", "out/m0d.bin".to_string());
-    let net = match net::Net::load(&path) {
+fn load_or_exit(path: &str) -> net::Net {
+    match net::Net::load(path) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("{} : {}", path, e);
             std::process::exit(1);
         }
+    }
+}
+
+/// Étage de référence (0-based) : --stage N (1-based), sinon <modèle>.stage, sinon étage final.
+fn stage_of(a: &[String], path: &str) -> usize {
+    let nst = train::stages(&Prior::demo()).len();
+    let s: usize = opt(a, "--stage", 0usize);
+    if s >= 1 {
+        return (s - 1).min(nst - 1);
+    }
+    train::load_stage(path).unwrap_or(nst - 1).min(nst - 1)
+}
+
+fn cmd_train(a: &[String]) {
+    let threads_def = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cfg = train::Cfg {
+        seed: opt(a, "--seed", 1u64),
+        steps: opt(a, "--steps", 400_000usize),
+        batch: opt(a, "--batch", 64usize),
+        threads: opt(a, "--threads", threads_def),
+        lr: opt(a, "--lr", 2e-3f64),
+        lr_min: opt(a, "--lrmin", 1e-4f64),
+        cycle: opt(a, "--cycle", 8000usize),
+        max_cycles: opt(a, "--maxcyc", 4usize),
+        peak_decay: opt(a, "--peakdecay", 0.7f64),
+        clip: opt(a, "--clip", 1.0f64),
+        w_trace: opt(a, "--wtrace", 1.0f64),
+        mut_frac: opt(a, "--mut", 0.25f64),
+        up: opt(a, "--up", 0.90f64),
+        gate: opt(a, "--gate", 0.95f64),
+        every: opt(a, "--every", 1000usize),
+        n_val: opt(a, "--nval", 500usize),
+        n_gate: opt(a, "--ngate", 3000usize),
+        secs: opt(a, "--secs", 0.0f64),
+        from: opt(a, "--from", 1usize).saturating_sub(1),
+        out: opt(a, "--out", "m0d.bin".to_string()),
+        init: opt(a, "--init", String::new()),
     };
-    let v = eval::report(&net, &ecfg(a));
+    let (net, stage) = train::train(&cfg);
+    println!("modèle : {} (étage de référence {})\n", cfg.out, stage + 1);
+    let v = eval::report(&net, &ecfg(a), stage);
     std::process::exit(v.code());
+}
+
+fn cmd_eval(a: &[String]) {
+    let path: String = opt(a, "--model", "m0d.bin".to_string());
+    let net = load_or_exit(&path);
+    let stage = stage_of(a, &path);
+    let v = eval::report(&net, &ecfg(a), stage);
+    std::process::exit(v.code());
+}
+
+fn cmd_diag(a: &[String]) {
+    let path: String = opt(a, "--model", "m0d.bin".to_string());
+    let net = load_or_exit(&path);
+    let sts = train::stages(&Prior::demo());
+    let stage = stage_of(a, &path);
+    diag::run(&net, &sts[stage], opt(a, "--n", 4000usize), opt(a, "--eseed", 9001u64), opt(a, "--horizon", 0usize));
 }
 
 fn main() {
@@ -163,8 +193,9 @@ fn main() {
         Some("check") => eval::selfcheck(),
         Some("train") => cmd_train(&args[2..]),
         Some("eval") => cmd_eval(&args[2..]),
+        Some("diag") => cmd_diag(&args[2..]),
         _ => eprintln!(
-            "usage : selftest | monde [seed] [n] | gradcheck [seed] | overfit [seed] | check | train [--opts] | eval [--opts]"
+            "usage : selftest | monde [seed] [n] | gradcheck [seed] | overfit [seed] | check | train [--opts] | eval [--opts] | diag [--opts]"
         ),
     }
 }
