@@ -11,7 +11,7 @@ env:
   OPENBLAS_NUM_THREADS: "1"
   MKL_NUM_THREADS: "1"
   OMP_NUM_THREADS: "1"
-  RAYON_NUM_THREADS: "2"
+  RAYON_NUM_THREADS: "4"
 
 jobs:
   build:
