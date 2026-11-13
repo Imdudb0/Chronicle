@@ -127,7 +127,7 @@ fn cmd_train(a: &[String]) {
         every: opt(a, "--every", 250usize),
         n_val: opt(a, "--nval", 400usize),
         secs: opt(a, "--secs", 0.0f64),
-        out: opt(a, "--out", "m0d.bin".to_string()),
+        out: opt(a, "--out", "out/m0d.bin".to_string()),
         init: opt(a, "--init", String::new()),
     };
     let net = train::train(&cfg);
@@ -137,7 +137,7 @@ fn cmd_train(a: &[String]) {
 }
 
 fn cmd_eval(a: &[String]) {
-    let path: String = opt(a, "--model", "m0d.bin".to_string());
+    let path: String = opt(a, "--model", "out/m0d.bin".to_string());
     let net = match net::Net::load(&path) {
         Ok(n) => n,
         Err(e) => {
