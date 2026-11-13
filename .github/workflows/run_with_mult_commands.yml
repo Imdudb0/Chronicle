@@ -25,11 +25,6 @@ jobs:
         env:
           RUSTFLAGS: "-C target-cpu=native"
 
-      - name: Run Chronicle application (m1.bin)
-        run: RUST_BACKTRACE=full cargo run --release -- train --out out/m1.bin --secs 1800
-        env:
-          RUSTFLAGS: "-C target-cpu=native"
-
       # 0. sidecar de plage de m1.bin (T ≤ 6, q ≤ 3, k ≤ 4)
       - name: Sidecar m1.bin.ref
         run: |
