@@ -88,6 +88,12 @@ pub fn rehorizon(s: &Sample, t: usize) -> Option<Sample> {
     })
 }
 
+/// Un monde est trivial si E est constant : rien à mémoriser, D peut le réussir à tout horizon.
+/// Toutes les mesures (validation, courbes, verdict) l'excluent ; l'entraînement, lui, le garde.
+pub fn nontrivial(s: &Sample) -> bool {
+    s.emit.iter().any(|&b| b != s.emit[0])
+}
+
 // ---------- agrégats ----------
 
 #[derive(Clone, Debug, Default)]
@@ -181,13 +187,15 @@ impl Agg {
     }
 }
 
-/// Validation pendant l'entraînement : n mondes non vus du prior `pr`.
 pub fn validate(net: &Net, pr: &Prior, n: usize, rng: &mut Rng, ws: &mut Work) -> Agg {
     let mut a = Agg::default();
     let mut guard = 0usize;
     while a.n < n && guard < 100 * n.max(1) {
         guard += 1;
         if let Some(s) = draw_world(rng, pr, Part::Held, 1_000_000) {
+            if !nontrivial(&s) {
+                continue;
+            }
             let st = net.run_sample(&s, 1.0, ws, None);
             a.add(&s, &st);
         }
