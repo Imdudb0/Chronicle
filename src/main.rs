@@ -1,5 +1,6 @@
 mod meta;
 mod rng;
+mod net;
 
 use meta::*;
 use rng::Rng;
@@ -89,11 +90,21 @@ fn monde(args: &[String]) {
     }
 }
 
+fn arg<T: std::str::FromStr>(a: &[String], i: usize, d: T) -> T {
+    a.get(i).and_then(|s| s.parse::<T>().ok()).unwrap_or(d)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("selftest") => selftest(),
         Some("monde") => monde(&args[2..]),
-        _ => eprintln!("usage : m0 selftest | m0 monde [seed] [n]"),
+        Some("gradcheck") => {
+            if !net::gradcheck(arg(&args, 2, 1u64)) {
+                std::process::exit(1);
+            }
+        }
+        Some("overfit") => net::overfit(arg(&args, 2, 1u64)),
+        _ => eprintln!("usage : selftest | monde [seed] [n] | gradcheck [seed] | overfit [seed]"),
     }
 }
