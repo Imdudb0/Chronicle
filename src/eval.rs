@@ -228,6 +228,9 @@ pub fn axis_len(net: &Net, pr: &Prior, mults: &[usize], ec: &ECfg, ws: &mut Work
             Some(s) => s,
             None => continue,
         };
+        if !nontrivial(&s) {
+            continue; // monde trivial (E constant à 1×) : exclu de toutes les mesures
+        }
         // le même monde à tous les horizons ; rejet si la file s'épuise ou si qmax sort de la plage
         let mut at: Vec<Sample> = Vec::with_capacity(mults.len());
         for &m in mults {
@@ -263,6 +266,9 @@ pub fn axis_depth(net: &Net, pr: &Prior, mults: &[usize], ec: &ECfg, ws: &mut Wo
         while a.n < ec.n && guard < 400 * ec.n.max(1) && clock.elapsed().as_secs_f64() < ec.secs {
             guard += 1;
             if let Some(s) = draw_world(&mut rng, &pb, Part::Held, 100_000) {
+                if !nontrivial(&s) {
+                    continue;
+                }
                 let st = net.run_sample(&s, 1.0, ws, None);
                 a.add(&s, &st);
             }
@@ -283,7 +289,7 @@ pub fn totality(net: &Net, pr: &Prior, ec: &ECfg, ws: &mut Work) -> Agg {
         guard += 1;
         if let Some(par) = draw_world(&mut rng, pr, Part::Held, 100_000) {
             if let Some(c) = mutate_sample(&mut rng, &par, pr, 200) {
-                if in_part(&c.prog, Part::Held) {
+                if in_part(&c.prog, Part::Held) && nontrivial(&c) {
                     let st = net.run_sample(&c, 1.0, ws, None);
                     a.add(&c, &st);
                 }
@@ -327,7 +333,7 @@ impl Verdict {
             Verdict::Pass => "D tient à 2× : « simulateur appris, extrapolable » survit à M0. Passer à M1 (garder la courbe 4× comme référence).",
             Verdict::Gray => "Dégradation nette sans effondrement : lire le 4× et les colonnes oct/tk et règle/tk (dérive lente ou chute brutale) avant de décider.",
             Verdict::Kill => "D s'effondre à 2× sans correctif architectural : le banc est local et le transfert meurt ici. Corriger le substrat (M0 bis) avant tout M1.",
-            Verdict::Inconclusive => "fid(1×) sous le seuil, ou échantillon insuffisant : D n'a pas appris en distribution, l'extrapolation ne se juge pas. Prolonger l'entraînement (--init, --steps, --secs).",
+            Verdict::Inconclusive => "fid(1×) sous le seuil ou échantillon insuffisant : D n'a pas maîtrisé sa propre plage d'entraînement, l'extrapolation ne se juge pas. Prolonger n'aide pas s'il y a plateau : lancer `diag`, puis `train` v2 (cycles) ou changer le substrat.",
         }
     }
 }
@@ -385,14 +391,23 @@ fn row(label: &str, a: &Agg) {
     );
 }
 
-pub fn report(net: &Net, ec: &ECfg) -> Verdict {
-    let pr = Prior::demo();
+pub fn report(net: &Net, ec: &ECfg, stage: usize) -> Verdict {
+    let sts = crate::train::stages(&Prior::demo());
+    let stage = stage.min(sts.len() - 1);
+    let pr = sts[stage].clone();
     let mults = [1usize, 2, 4];
     let mut ws = Work::new();
-    println!("=== M0 : fidélité de D sur programmes non vus (hash(C) mod {} = 0) ===", HELD_MOD);
     println!(
-        "entraînement : T ∈ [{}, {}], qmax ≤ {} | fid = régénération exacte ∧ trace exacte | ± = IC 95 % | div = part des E non constants",
-        pr.t_lo, pr.t_hi, pr.q_hi
+        "=== M0 : fidélité de D sur programmes non vus (hash(C) mod {} = 0), mondes non triviaux (E non constant) ===",
+        HELD_MOD
+    );
+    println!(
+        "référence = étage d'entraînement {}/{} : T ∈ [{}, {}], qmax ≤ {} (1× = cette plage) | fid = régénération exacte ∧ trace exacte | ± = IC 95 % | div = 1,00 par construction",
+        stage + 1,
+        sts.len(),
+        pr.t_lo,
+        pr.t_hi,
+        pr.q_hi
     );
 
     let al = axis_len(net, &pr, &mults, ec, &mut ws);
@@ -403,14 +418,14 @@ pub fn report(net: &Net, ec: &ECfg) -> Verdict {
     }
 
     let ad = axis_depth(net, &pr, &mults, ec, &mut ws);
-    println!("\nAXE PROFONDEUR : prior étendu, T ∈ [{}, {}] (le point 1× est la référence en distribution)", pr.t_lo, pr.t_hi);
+    println!("\nAXE PROFONDEUR : même plage de T [{}, {}], bins de qmax ×1 / ×2 / ×4 de {}", pr.t_lo, pr.t_hi, pr.q_hi);
     head();
     for (i, b) in ad.iter().enumerate() {
         row(&format!("{}×  q∈[{},{}]", mults[i], b.0, b.1), &b.2);
     }
 
     let to = totality(net, &pr, ec, &mut ws);
-    println!("\nTOTALITÉ : voisins mutés (do local) de programmes non vus, prior final");
+    println!("\nTOTALITÉ : voisins mutés (do local) de programmes non vus, même prior");
     head();
     row("mutés", &to);
 
