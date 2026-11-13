@@ -3,6 +3,7 @@ mod rng;
 mod net;
 mod eval;
 mod train;
+mod diag;
 
 use meta::*;
 use rng::Rng;
