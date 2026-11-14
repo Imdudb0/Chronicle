@@ -597,3 +597,94 @@ pub fn reads(net: &mut Net, pr: &Prior, q: usize, taus: &[f64], n: usize, seed: 
     println!("netteté (τ > 1) : {}", if sharp { "OUI" } else { "NON" });
     println!("(3) PRÉSENCE : rapport {} → {} | RÉTENTION : rapport {} → {}", opt2(pres), yn(pres), opt2(rete), yn(rete));
 }
+
+/// Repère propre à D : où tombe l'argmax de la lecture, sans supposer « tête en m·k ».
+/// Mondes non vus, peu profonds (ℓ ≤ q partout) et réussis de bout en bout : c'est là que D a raison.
+pub fn frame(net: &Net, pr: &Prior, q: usize, n: usize, seed: u64) {
+    let mut rng = Rng::new(seed ^ 0xF4A3);
+    let mut ws = Work::new();
+    let (na, nc, nb) = (4usize, 3usize, 25usize); // a ∈ 0..=3, c ∈ −1..=1, b ∈ −12..=12
+    let mut hit = vec![vec![0usize; na * nc * nb]; 2];
+    let (mut cnt, mut nw) = ([0usize; 2], [0usize; 2]);
+    let mut by_k: Vec<Vec<HashMap<usize, usize>>> = vec![vec![HashMap::new(); 16]; 2];
+    let mut guard = 0usize;
+    while nw[0] + nw[1] < n && guard < 40 * n.max(1) {
+        guard += 1;
+        let s = match draw(&mut rng, pr) {
+            Some(s) => s,
+            None => break,
+        };
+        let ql = queue_lens(&s.prog, s.t);
+        if ql.iter().any(|&x| x > q) {
+            continue;
+        }
+        net.run_sample(&s, 1.0, &mut ws, None);
+        if first_error(&s, &ws).is_some() {
+            continue;
+        }
+        let mi = s.prog.m - 1;
+        nw[mi] += 1;
+        for k in 0..s.t {
+            let a = ws.att_row(k);
+            let mut am = 0usize;
+            for i in 1..a.len() {
+                if a[i] > a[am] {
+                    am = i;
+                }
+            }
+            if k < 16 {
+                *by_k[mi][k].entry(am).or_insert(0) += 1;
+            }
+            if k == 0 {
+                continue; // une seule cellule visible : argmax forcé
+            }
+            cnt[mi] += 1;
+            for ai in 0..na {
+                for ci in 0..nc {
+                    for bi in 0..nb {
+                        let pred = (ai * k) as i64 + (ci as i64 - 1) * ql[k] as i64 + (bi as i64 - 12);
+                        if pred == am as i64 {
+                            hit[mi][(ai * nc + ci) * nb + bi] += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("=== FRAME : où tombe l'argmax de la lecture de D ? mondes non vus peu profonds (ℓ ≤ {}), réussis de bout en bout ===", q);
+    for mi in 0..2 {
+        if cnt[mi] == 0 {
+            continue;
+        }
+        let mut hs: Vec<(usize, usize)> = hit[mi].iter().cloned().enumerate().collect();
+        hs.sort_by(|x, y| y.1.cmp(&x.1));
+        println!("\nm = {} : {} mondes, {} ticks (k ≥ 1). Hypothèse « argmax = a·k + c·ℓ + b », les 6 meilleures :", mi + 1, nw[mi], cnt[mi]);
+        for &(h, c) in hs.iter().take(6) {
+            let (ai, ci, bi) = (h / (nc * nb), (h % (nc * nb)) / nb, h % nb);
+            println!("  a={} c={:+} b={:+} : {:.1} %", ai, ci as i64 - 1, bi as i64 - 12, 100.0 * c as f64 / cnt[mi] as f64);
+        }
+        print!("  argmax modal par tick k (part des mondes) :");
+        for k in 0..16 {
+            let tot: usize = by_k[mi][k].values().sum();
+            if let Some((i, c)) = by_k[mi][k].iter().max_by_key(|x| (*x.1, std::cmp::Reverse(*x.0))) {
+                print!(" {}:{}({:.0}%)", k, i, 100.0 * *c as f64 / tot as f64);
+            }
+        }
+        println!();
+    }
+    let best: Vec<f64> = (0..2)
+        .filter(|&mi| cnt[mi] >= 200)
+        .map(|mi| *hit[mi].iter().max().unwrap() as f64 / cnt[mi] as f64)
+        .collect();
+    let v = if best.is_empty() {
+        "ÉCHANTILLON INSUFFISANT"
+    } else if best.iter().all(|&b| b >= 0.6) {
+        "REPÈRE TROUVÉ"
+    } else if best.iter().all(|&b| b >= 0.3) {
+        "PARTIEL"
+    } else {
+        "PAS DE POINTEUR"
+    };
+    println!("\nrègle (fixée avant mesure) : REPÈRE TROUVÉ si la meilleure hypothèse atteint 60 % pour chaque m ; PARTIEL entre 30 et 60 % ; sinon PAS DE POINTEUR (lecture répartie : aucun oracle de cellule n'a de sens). n ≥ 200 ticks par m.");
+    println!("verdict : {}", v);
+}
