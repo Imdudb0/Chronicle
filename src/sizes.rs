@@ -14,6 +14,7 @@
 use crate::eval::{draw_world, nontrivial, Part};
 use crate::meta::{Prior, Program};
 use crate::net::{decode, Net, Work, NOUT};
+use crate::tape::{decode, Net, Work, NOUT};
 use crate::rng::Rng;
 use std::collections::VecDeque;
 
