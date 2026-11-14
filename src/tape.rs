@@ -169,6 +169,14 @@ impl Work {
     }
 }
 
+impl Work {
+    /// Poids d'attention de lecture du tick k (après forward) sur les cellules 0..min(n, 3k+1).
+    pub fn att_row(&self, k: usize) -> &[f64] {
+        let n = self.n;
+        &self.att[k * n..k * n + n.min(3 * k + 1)]
+    }
+}
+
 /// i-ème symbole de la file initiale (one-hot sur NSLOT, « vide » au-delà de Q_MAX).
 fn xs(z: &[f64], i: usize) -> [f64; NSLOT] {
     let mut x = [0.0f64; NSLOT];
@@ -192,6 +200,9 @@ pub struct Net {
     pub lay: Lay,
     pub p: Vec<f64>,
     pub rho: f64,
+    pub tau: f64,   // température de l'attention de lecture (1.0 = comportement actuel)
+    pub hard: bool, // sonde : attention forcée sur la cellule m·k (inférence seulement)
+ }
 }
 
 impl Net {
@@ -219,7 +230,7 @@ impl Net {
         fill(rng, &mut p[l.gw..l.gw + DW * Z_DIM], 0.15);
         fill(rng, &mut p[l.wo..l.wo + NOUT * DR], 0.03);
         fill(rng, &mut p[l.vo..l.vo + NOUT * DW], 0.03);
-        Net { lay, p, rho: f64::INFINITY }
+        Net { lay, p, rho: f64::INFINITY, tau: 1.0, hard: false }
     }
 
     /// t ticks à partir de z (= C,V encodés). Sorties : ws.y[k*NOUT..].
@@ -250,6 +261,7 @@ impl Net {
                 ws.s[i * DC + d] = a.tanh();
             }
         }
+        let m_read = if ws.z[1] > 0.5 { 2usize } else { 1usize };
         for k in 0..t {
             let na = n.min(3 * k + 1);
             let (sa, sb) = ws.s.split_at_mut((k + 1) * n * DC);
@@ -261,6 +273,7 @@ impl Net {
                 for d in 0..DC {
                     lg += p[l.ua + d] * sk[i * DC + d];
                 }
+                let lg = lg * self.tau;
                 ws.att[k * n + i] = lg;
                 if lg > mx {
                     mx = lg;
@@ -271,6 +284,13 @@ impl Net {
                 let e = (ws.att[k * n + i] - mx).exp();
                 ws.att[k * n + i] = e;
                 sum += e;
+            }
+            if self.hard {
+                let hd = (m_read * k).min(na - 1);
+                for i in 0..na {
+                    ws.att[k * n + i] = if i == hd { 1.0 } else { 0.0 };
+                }
+                sum = 1.0;
             }
             let rk = &mut ws.r[k * DR..(k + 1) * DR];
             for x in rk.iter_mut() {
@@ -465,7 +485,7 @@ impl Net {
             }
             for i in 0..na {
                 let a = ws.att[k * n + i];
-                let dl = a * (ws.dl[i] - ssum);
+                let dl = self.tau * a * (ws.dl[i] - ssum);
                 let si = &ws.s[(k * n + i) * DC..(k * n + i + 1) * DC];
                 for j in 0..DR {
                     let dv = a * dr[j];
