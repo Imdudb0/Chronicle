@@ -1,18 +1,3 @@
-// Entraînement de D (v4) : minibatchs parallèles (threads std), Adam, curriculum piloté par la fidélité,
-// ou plage fixe (--thi / --qhi) pour le contrôle de plage d'entraînement.
-//
-// • Programmes d'entraînement : jamais le sous-ensemble « non vu » (hash(C) mod 8 = 0), voisins mutés compris.
-// • lr en cycles cosinus dans chaque étage : crête → lr_min ; crête × peak_decay à chaque cycle de plus.
-//   v4 : crête du premier cycle = lr à l'étage de départ, lr_stage aux étages suivants, avec une montée
-//   linéaire de `warm` pas à l'entrée de ces étages.
-// • v4 : plafond de gain rétrograde rho (tape::Net.rho) ; la colonne « plaf » donne la part de ticks rognés.
-// • v4 : à chaque montée d'étage, fid « zéro-coup » des poids de fin d'étage sur la plage suivante.
-// • v4 : énergie du gradient par groupe de paramètres (top 3) dans chaque ligne de suivi.
-// • Porte jugée en fin de cycle (lr minimal) sur n_gate mondes non vus non triviaux : étage intermédiaire,
-//   fid ≥ up → on monte ; étage final, fid ≥ gate → on s'arrête ; max_cycles cycles sans la franchir → arrêt.
-// • --kmax : taille d'alphabet maximale des causes (bouton du prior, au grand livre).
-// • <out>.ref garde la plage d'entraînement « t_hi q_hi k_max » : eval, diag, sizes et cmp la lisent par défaut.
-// • Un Rng, un Work et un tampon de gradient par fil ; déterministe pour (seed, nombre de fils).
 #![allow(dead_code)]
 
 use crate::eval::{draw_world, in_part, nontrivial, validate, Agg, Part};
@@ -45,6 +30,7 @@ pub struct Cfg {
     pub secs: f64,         // plafond de temps (0 = aucun)
     pub from: usize,       // étage de départ (0-based)
     pub kmax: usize,       // alphabet max des causes
+    pub trunc: bool,       // troncature de l'horizon au lieu du rejet par qmax
     pub fixed: Option<(usize, usize)>, // plage fixe (t_hi, q_hi) : un seul étage, sans curriculum
     pub out: String,
     pub init: String,
@@ -135,6 +121,7 @@ impl Worker {
 pub fn train(cfg: &Cfg) -> (Net, Prior) {
     let mut fin = Prior::demo();
     fin.k_max = cfg.kmax;
+    fin.trunc = cfg.trunc;
     let sts: Vec<Prior> = match cfg.fixed {
         Some((t, q)) => {
             let mut p = fin.clone();
@@ -198,6 +185,10 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
         100.0 * cfg.up,
         100.0 * cfg.gate,
         cfg.n_gate
+    );
+    println!(
+        "génération : {}",
+        if cfg.trunc { "troncature (horizon coupé au dernier tick dont la file lue est ≤ q)" } else { "rejet par qmax (v1)" }
     );
     println!("étage {}/{} : T ≤ {}, qmax ≤ {}", stage + 1, nst, sts[stage].t_hi, sts[stage].q_hi);
 
