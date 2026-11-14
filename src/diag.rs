@@ -5,6 +5,7 @@
 use crate::eval::{draw_world, nontrivial, rehorizon, Part};
 use crate::meta::{Prior, Sample, K_MAX, W_MAX};
 use crate::net::{decode, Net, Work, NB, NOUT};
+use crate::tape::{decode, Net, Work, NB, NOUT};
 use crate::rng::Rng;
 
 #[derive(Clone, Copy, Default)]
