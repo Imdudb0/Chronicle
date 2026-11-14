@@ -409,7 +409,7 @@ impl Net {
         let mut z = [0f32; Z_DIM];
         encode(&s.prog, &s.view, &mut z);
         self.forward(&z, s.t, ws);
-        let st = loss_dy(s, w_trace, ws);
+        let st = loss_raw(s, w_trace, &ws.y, &mut ws.dy);
         if let Some(g) = g {
             self.backward(s.t, ws, g);
         }
@@ -485,14 +485,14 @@ pub fn decode(y: &[f64]) -> (u8, usize) {
 }
 
 /// Perte = (1/T)·Σ_k [ flag_k·(1/8)·Σ_i BCE(bit_i) + w_trace·CE(règle) ] ; écrit ws.dy.
-fn loss_dy(s: &Sample, w_trace: f64, ws: &mut Work) -> Stat {
+pub fn loss_raw(s: &Sample, w_trace: f64, ys: &[f64], dys: &mut [f64]) -> Stat {
     let t = s.t;
     let inv_t = 1.0 / t as f64;
     let mut st = Stat { t, regen: true, trace_all: true, ..Stat::default() };
     let (mut lb, mut lt) = (0.0f64, 0.0f64);
     for k in 0..t {
-        let y = &ws.y[k * NOUT..(k + 1) * NOUT];
-        let dy = &mut ws.dy[k * NOUT..(k + 1) * NOUT];
+        let y = &ys[k * NOUT..(k + 1) * NOUT];
+        let dy = &mut dys[k * NOUT..(k + 1) * NOUT];
         for d in dy.iter_mut() {
             *d = 0.0;
         }
