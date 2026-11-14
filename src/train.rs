@@ -147,21 +147,20 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
     let mut rng = Rng::new(cfg.seed);
     let mut net = Net::new(&mut rng);
     if !cfg.init.is_empty() {
-        match Net::load(&cfg.init) {
-            Ok(n) => {
-                net = n;
-                println!("poids initiaux : {}", cfg.init);
-            }
+    match Net::load(&cfg.init) {
+        Ok(n) => {
+            net = n;
+            println!("poids initiaux : {}", cfg.init);
             if load_split(&cfg.init).unwrap_or(false) != crate::eval::split_canon() {
-                    eprintln!("attention : --init vient d'un autre split ; les mondes « non vus » de l'un ont servi à entraîner l'autre");
-                }
-             }
-            Err(e) => {
-                eprintln!("--init {} : {}", cfg.init, e);
-                std::process::exit(1);
+                eprintln!("attention : --init vient d'un autre split ; les mondes « non vus » de l'un ont servi à entraîner l'autre");
             }
         }
+        Err(e) => {
+            eprintln!("--init {} : {}", cfg.init, e);
+            std::process::exit(1);
+        }
     }
+  }
     net.rho = cfg.rho;
     let np = net.p.len();
     let nth = cfg.threads.clamp(1, cfg.batch.max(1));
