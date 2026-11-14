@@ -1,0 +1,5084 @@
+========================================
+File: ./src/cursor.rs
+========================================
+use crate::engine::{Engine, StateMachine};
+use crate::error::{Error, Result};
+use crate::journal::Frames;
+pub struct Cursor<'e, S: StateMachine> {
+    engine: &'e Engine<S>,
+    seq: u64,
+    state: S,
+    frames: Frames<'e>,
+}
+impl<'e, S: StateMachine> Cursor<'e, S> {
+    pub(crate) fn new(engine: &'e Engine<S>, seq: u64, state: S) -> Self {
+        let frames = engine.journal().frames_from(seq + 1);
+        Self { engine, seq, state, frames }
+    }
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+    pub fn state(&self) -> &S {
+        &self.state
+    }
+    pub fn into_state(self) -> S {
+        self.state
+    }
+    pub fn at_end(&self) -> bool {
+        self.seq == self.engine.last_seq()
+    }
+    pub fn peek(&self) -> Result<Option<S::Event>> {
+        self.event_at(self.seq + 1)
+    }
+    pub fn step_forward(&mut self) -> Result<Option<S::Event>> {
+        let Some(frame) = self.frames.next() else { return Ok(None) };
+        debug_assert_eq!(frame.seq, self.seq + 1);
+        let event: S::Event = postcard::from_bytes(frame.payload)?;
+        self.state.apply(&event);
+        self.seq = frame.seq;
+        Ok(Some(event))
+    }
+    pub fn step_back(&mut self) -> Result<Option<S::Event>> {
+        if self.seq == 0 {
+            return Ok(None);
+        }
+        let undone = self.seq;
+        self.goto(undone - 1)?;
+        self.event_at(undone)
+    }
+    pub fn goto(&mut self, target: u64) -> Result<()> {
+        let engine = self.engine;
+        let last = engine.last_seq();
+        if target > last {
+            return Err(Error::SeqOutOfRange { requested: target, last });
+        }
+        if target < self.seq {
+            self.state = engine.state_at(target)?;
+            self.seq = target;
+            self.frames = engine.journal().frames_from(target + 1);
+        } else {
+            while self.seq < target {
+                if self.step_forward()?.is_none() {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn run_until(&mut self, mut stop: impl FnMut(&S, u64) -> bool) -> Result<Option<u64>> {
+        while self.step_forward()?.is_some() {
+            if stop(&self.state, self.seq) {
+                return Ok(Some(self.seq));
+            }
+        }
+        Ok(None)
+    }
+    fn event_at(&self, seq: u64) -> Result<Option<S::Event>> {
+        match self.engine.journal().frames_from(seq).next() {
+            Some(frame) if frame.seq == seq => Ok(Some(postcard::from_bytes(frame.payload)?)),
+            _ => Ok(None),
+        }
+    }
+}
+
+
+
+========================================
+File: ./src/diag.rs
+========================================
+#![allow(dead_code)]
+use crate::eval::{draw_world, nontrivial, rehorizon, Part};
+use crate::meta::{Prior, Sample, K_MAX, W_MAX};
+use crate::tape::{decode, Net, Work, NB, NOUT};
+use crate::rng::Rng;
+#[derive(Clone, Copy, Default)]
+struct Tab {
+    n: [usize; 16],
+    ok: [usize; 16],
+}
+impl Tab {
+    fn add(&mut self, i: usize, ok: bool) {
+        let i = i.min(15);
+        self.n[i] += 1;
+        self.ok[i] += ok as usize;
+    }
+    fn show(&self, title: &str, lo: usize, hi: usize) {
+        print!("{:<26}", title);
+        for i in lo..=hi.min(15) {
+            if self.n[i] > 0 {
+                print!(" | {}: n={} fid {:.1}%", i, self.n[i], 100.0 * self.ok[i] as f64 / self.n[i] as f64);
+            }
+        }
+        println!();
+    }
+}
+fn pct(a: usize, b: usize) -> f64 {
+    100.0 * a as f64 / b.max(1) as f64
+}
+pub fn run(net: &Net, pr: &Prior, n: usize, seed: u64, horizon: usize) {
+    let mut rng = Rng::new(seed ^ 0xD1A6);
+    let mut ws = Work::new();
+    let tmax = horizon.max(pr.t_hi).max(1);
+    let mut hz_n = vec![0usize; tmax];
+    let mut hz_rule = vec![0usize; tmax];
+    let mut hz_byte = vec![0usize; tmax];
+    let (mut by_nt, mut by_m, mut by_k, mut by_pl, mut by_q) =
+        (Tab::default(), Tab::default(), Tab::default(), Tab::default(), Tab::default());
+    let (mut got, mut n_ok, mut mismatch) = (0usize, 0usize, 0usize);
+    let (mut r_tot, mut r_ghost, mut r_rep, mut r_lead) = (0usize, 0usize, 0usize, 0usize);
+    let (mut r_near, mut r_conf, mut b_tot, mut b_near) = (0usize, 0usize, 0usize, 0usize);
+    let mut b_bits = [0usize; 4];
+    let mut guard = 0usize;
+    while got < n && guard < 200 * n.max(1) {
+        guard += 1;
+        let s0 = match draw_world(&mut rng, pr, Part::Held, 1_000_000) {
+            Some(s) => s,
+            None => continue,
+        };
+        let s: Sample = if horizon > 0 {
+            match rehorizon(&s0, horizon) {
+                Some(x) if x.qmax <= pr.q_hi => x,
+                _ => continue,
+            }
+        } else {
+            s0
+        };
+        let st = net.run_sample(&s, 1.0, &mut ws, None);
+        let mut failed = false;
+        for k in 0..s.t {
+            let y = &ws.y[k * NOUT..(k + 1) * NOUT];
+            let (b, r) = decode(y);
+            let tr = s.trace[k] as usize;
+            hz_n[k] += 1;
+            if r != tr {
+                failed = true;
+                hz_rule[k] += 1;
+                r_tot += 1;
+                if r >= s.prog.k() {
+                    r_ghost += 1;
+                }
+                if k > 0 && r == s.trace[k - 1] as usize {
+                    r_rep += 1;
+                } else if k + 1 < s.t && r == s.trace[k + 1] as usize {
+                    r_lead += 1;
+                }
+                let margin = y[NB + r] - y[NB + tr];
+                if margin < 1.0 {
+                    r_near += 1;
+                } else if margin > 4.0 {
+                    r_conf += 1;
+                }
+                break;
+            }
+            if s.flag[k] && b != s.emit[k] {
+                failed = true;
+                hz_byte[k] += 1;
+                b_tot += 1;
+                let diff = b ^ s.emit[k];
+                b_bits[(diff.count_ones() as usize - 1).min(3)] += 1;
+                let mut mn = f64::INFINITY;
+                for i in 0..NB {
+                    if (diff >> i) & 1 == 1 {
+                        mn = mn.min(y[i].abs());
+                    }
+                }
+                if mn < 1.0 {
+                    b_near += 1;
+                }
+                break;
+            }
+        }
+        let ok = !failed;
+        if ok {
+            n_ok += 1;
+        }
+        if ok != (st.regen && st.trace_all) {
+            mismatch += 1;
+        }
+        let maxpl = s.prog.prod.iter().map(|w| w.len()).max().unwrap_or(0);
+        by_nt.add(nontrivial(&s) as usize, ok);
+        by_m.add(s.prog.m, ok);
+        by_k.add(s.prog.k(), ok);
+        by_pl.add(maxpl, ok);
+        by_q.add(s.qmax, ok);
+        got += 1;
+    }
+    println!(
+        "=== DIAG : D sur {} mondes non vus (T ∈ [{}, {}], qmax ≤ {}{}) ===",
+        got,
+        pr.t_lo,
+        pr.t_hi,
+        pr.q_hi,
+        if horizon > 0 { format!(", horizon forcé à {}", horizon) } else { String::new() }
+    );
+    println!(
+        "fid (tous mondes, triviaux compris) : {:.1}%   écarts avec la perte d'entraînement : {} (doit être 0)",
+        pct(n_ok, got),
+        mismatch
+    );
+    println!("\nRISQUE PAR TICK : P(première erreur au tick k | tout juste avant), en %");
+    println!("{:>4}{:>10}{:>11}{:>11}", "k", "à risque", "règle", "octet");
+    for k in 0..tmax {
+        if hz_n[k] > 0 {
+            println!("{:>4}{:>10}{:>11.2}{:>11.2}", k, hz_n[k], pct(hz_rule[k], hz_n[k]), pct(hz_byte[k], hz_n[k]));
+        }
+    }
+    println!("\nPAR CLASSE (fid exacte)");
+    by_nt.show("E constant (0) / non (1)", 0, 1);
+    by_m.show("m (pops par tick)", 1, 2);
+    by_k.show("k (nombre de règles)", 1, K_MAX);
+    by_pl.show("|production| max", 0, W_MAX);
+    by_q.show("qmax", 1, 15);
+    println!("\nANATOMIE de la première erreur des mondes ratés ({} de règle, {} d'octet)", r_tot, b_tot);
+    println!(
+        "règle fausse : inexistante {:.0}% | répète le tick précédent {:.0}% | prend celle du tick suivant {:.0}% | marge < 1 (hésitant) {:.0}% | marge > 4 (confiant) {:.0}%",
+        pct(r_ghost, r_tot),
+        pct(r_rep, r_tot),
+        pct(r_lead, r_tot),
+        pct(r_near, r_tot),
+        pct(r_conf, r_tot)
+    );
+    println!(
+        "octet faux (règle juste) : 1 bit {:.0}% | 2 bits {:.0}% | 3 bits {:.0}% | 4+ bits {:.0}% | bit fautif proche de 0 (|logit| < 1) {:.0}%",
+        pct(b_bits[0], b_tot),
+        pct(b_bits[1], b_tot),
+        pct(b_bits[2], b_tot),
+        pct(b_bits[3], b_tot),
+        pct(b_near, b_tot)
+    );
+    println!("lecture : marges < 1 dominantes = bruit d'optimisation ou de précision ; marges > 4 concentrées sur une classe = algorithme absent.");
+}
+
+
+
+========================================
+File: ./src/engine.rs
+========================================
+use std::path::{Path, PathBuf};
+use serde::{de::DeserializeOwned, Serialize};
+use crate::cursor::Cursor;
+use crate::error::{Error, Result};
+use crate::journal::{Frame, Journal, Recovery};
+use crate::snapshot::SnapshotStore;
+pub trait StateMachine: Sized + Serialize + DeserializeOwned {
+    type Event: Serialize + DeserializeOwned;
+    const STATE_VERSION: u32 = 1;
+    fn genesis() -> Self;
+    fn apply(&mut self, event: &Self::Event);
+}
+#[derive(Debug, Clone)]
+pub struct Options {
+    pub snapshot_every: u64,
+    pub keep_recent: usize,
+    pub milestone_every: u64,
+    pub snapshot_dir: Option<PathBuf>,
+}
+impl Default for Options {
+    fn default() -> Self {
+        Self { snapshot_every: 10_000, keep_recent: 3, milestone_every: 100_000, snapshot_dir: None }
+    }
+}
+pub struct Engine<S: StateMachine> {
+    journal: Journal,
+    snapshots: SnapshotStore,
+    opts: Options,
+    boot_seq: u64,
+    state: S,
+}
+impl<S: StateMachine> Engine<S> {
+    pub fn open(path: impl AsRef<Path>) -> Result<(Self, Recovery)> {
+        Self::open_with(path, Options::default())
+    }
+    pub fn open_with(path: impl AsRef<Path>, opts: Options) -> Result<(Self, Recovery)> {
+        let path = path.as_ref();
+        let (journal, recovery) = Journal::open(path)?;
+        let dir = opts.snapshot_dir.clone().unwrap_or_else(|| default_dir(path));
+        let mut snapshots = SnapshotStore::open(dir)?;
+        snapshots.quarantine_after(journal.last_seq());
+        let (mut state, boot_seq) = snapshots.load_best::<S>(&journal, journal.last_seq());
+        fold(&mut state, journal.frames_from(boot_seq + 1), u64::MAX)?;
+        Ok((Self { journal, snapshots, opts, boot_seq, state }, recovery))
+    }
+    pub fn submit(&mut self, event: &S::Event) -> Result<u64> {
+        let bytes = postcard::to_allocvec(event)?;
+        self.submit_encoded(&bytes)
+    }
+    pub fn submit_encoded(&mut self, bytes: &[u8]) -> Result<u64> {
+        let (event, rest) = postcard::take_from_bytes::<S::Event>(bytes)?;
+        if !rest.is_empty() {
+            return Err(Error::TrailingBytes);
+        }
+        let seq = self.journal.append(bytes)?;
+        self.state.apply(&event);
+        Ok(seq)
+    }
+    pub fn sync(&mut self) -> Result<()> {
+        self.journal.sync()
+    }
+    pub fn maybe_snapshot(&mut self) -> Result<()> {
+        let every = self.opts.snapshot_every;
+        let since = self.last_seq().saturating_sub(self.snapshots.latest().unwrap_or(0));
+        if every != 0 && since >= every {
+            self.journal.sync()?; 
+            self.write_snapshot()?;
+        }
+        Ok(())
+    }
+    pub fn commit(&mut self) -> Result<()> {
+        self.sync()?;
+        self.maybe_snapshot()
+    }
+    pub fn snapshot(&mut self) -> Result<u64> {
+        self.journal.sync()?; 
+        self.write_snapshot()
+    }
+    fn write_snapshot(&mut self) -> Result<u64> {
+        let seq = self.snapshots.save(&self.journal, &self.state)?;
+        self.snapshots.prune(self.opts.keep_recent.max(1), self.opts.milestone_every);
+        Ok(seq)
+    }
+    pub fn state(&self) -> &S {
+        &self.state
+    }
+    pub fn last_seq(&self) -> u64 {
+        self.journal.last_seq()
+    }
+    pub fn journal(&self) -> &Journal {
+        &self.journal
+    }
+    pub fn boot_seq(&self) -> u64 {
+        self.boot_seq
+    }
+    pub fn snapshots(&self) -> &[u64] {
+        self.snapshots.seqs()
+    }
+    pub fn state_at(&self, seq: u64) -> Result<S> {
+        let last = self.journal.last_seq();
+        if seq > last {
+            return Err(Error::SeqOutOfRange { requested: seq, last });
+        }
+        let (mut state, base) = self.snapshots.load_best::<S>(&self.journal, seq);
+        fold(&mut state, self.journal.frames_from(base + 1), seq)?;
+        Ok(state)
+    }
+    pub fn cursor(&self) -> Result<Cursor<'_, S>> {
+        self.cursor_at(self.last_seq())
+    }
+    pub fn cursor_at(&self, seq: u64) -> Result<Cursor<'_, S>> {
+        Ok(Cursor::new(self, seq, self.state_at(seq)?))
+    }
+}
+fn default_dir(journal: &Path) -> PathBuf {
+    let mut name = journal.as_os_str().to_owned();
+    name.push(".snapshots");
+    PathBuf::from(name)
+}
+fn fold<'a, S: StateMachine>(
+    state: &mut S,
+    frames: impl Iterator<Item = Frame<'a>>,
+    upto: u64,
+) -> Result<()> {
+    for frame in frames.take_while(|f| f.seq <= upto) {
+        let event: S::Event = postcard::from_bytes(frame.payload)?;
+        state.apply(&event);
+    }
+    Ok(())
+}
+
+
+
+========================================
+File: ./src/error.rs
+========================================
+use std::{fmt, io};
+pub type Result<T> = std::result::Result<T, Error>;
+#[derive(Debug)]
+pub enum Error {
+    Io(io::Error),
+    Codec(postcard::Error),
+    BadHeader(&'static str),
+    PayloadTooLarge(usize),
+    Locked,
+    SeqOutOfRange { requested: u64, last: u64 },
+    TrailingBytes,
+    Closed,
+}
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Io(e) => write!(f, "i/o error: {e}"),
+            Error::Codec(e) => write!(f, "codec error: {e}"),
+            Error::BadHeader(why) => write!(f, "invalid journal header: {why}"),
+            Error::PayloadTooLarge(n) => write!(f, "payload too large: {n} bytes"),
+            Error::Locked => write!(f, "journal is locked by another handle"),
+            Error::SeqOutOfRange { requested, last } => {
+                write!(f, "cycle {requested} out of range (last = {last})")
+            }
+            Error::TrailingBytes => write!(f, "trailing bytes after encoded event"),
+            Error::Closed => write!(f, "event loop is closed"),
+        }
+    }
+}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            Error::Codec(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        Error::Io(e)
+    }
+}
+impl From<postcard::Error> for Error {
+    fn from(e: postcard::Error) -> Self {
+        Error::Codec(e)
+    }
+}
+
+
+
+========================================
+File: ./src/eval.rs
+========================================
+#![allow(dead_code)]
+use crate::meta::{emit_of, mutate_sample, run, sample_world, Prior, Program, Sample};
+use crate::tape::{Net, Stat, Work};
+use crate::rng::Rng;
+use std::time::Instant;
+pub const HELD_MOD: u64 = 8;
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Part {
+    Train,
+    Held,
+}
+pub fn prog_hash(p: &Program) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut put = |x: u64| {
+        h ^= x;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    put(p.m as u64);
+    put(0x100 + p.k() as u64);
+    for &b in &p.bytes {
+        put(b as u64);
+    }
+    for w in &p.prod {
+        put(0x200);
+        for &x in w {
+            put(x as u64);
+        }
+    }
+    put(0x300);
+    for &x in &p.q0 {
+        put(x as u64);
+    }
+    h ^= h >> 32;
+    h = h.wrapping_mul(0xd6e8_feb8_6659_fd93);
+    h ^ (h >> 32)
+}
+pub fn in_part(p: &Program, part: Part) -> bool {
+    (prog_hash(p) % HELD_MOD == 0) == (part == Part::Held)
+}
+pub fn draw_world(rng: &mut Rng, pr: &Prior, part: Part, max_att: u32) -> Option<Sample> {
+    for _ in 0..512 {
+        let s = sample_world(rng, pr, max_att)?;
+        if in_part(&s.prog, part) {
+            return Some(s);
+        }
+    }
+    None
+}
+pub fn rehorizon(s: &Sample, t: usize) -> Option<Sample> {
+    let r = run(&s.prog, t)?;
+    let emit = emit_of(&s.prog, &r.trace);
+    let (o, step) = (s.view.o, s.view.s);
+    let flag: Vec<bool> = (0..t).map(|i| i >= o && (i - o) % step == 0).collect();
+    Some(Sample {
+        prog: s.prog.clone(),
+        view: s.view,
+        t,
+        trace: r.trace,
+        emit,
+        flag,
+        qmax: r.qmax,
+        bits_p: s.bits_p,
+        bits_v: s.bits_v,
+        bits_t: s.bits_t,
+        attempts: s.attempts,
+    })
+}
+pub fn nontrivial(s: &Sample) -> bool {
+    s.emit.iter().any(|&b| b != s.emit[0])
+}
+#[derive(Clone, Debug, Default)]
+pub struct Agg {
+    pub n: usize,
+    pub loss: f64,
+    pub n_flag: usize,
+    pub flag_ok: usize,
+    pub n_tick: usize,
+    pub trace_ok: usize,
+    pub regen: usize,
+    pub trace_all: usize,
+    pub both: usize,
+    pub sum_t: usize,
+    pub sum_q: usize,
+    pub sum_k: usize,
+    pub diverse: usize,
+}
+fn rate(a: usize, b: usize) -> f64 {
+    a as f64 / b.max(1) as f64
+}
+impl Agg {
+    pub fn add(&mut self, s: &Sample, st: &Stat) {
+        self.n += 1;
+        self.loss += st.loss;
+        self.n_flag += st.n_flag;
+        self.flag_ok += st.flag_ok;
+        self.n_tick += st.t;
+        self.trace_ok += st.trace_ok;
+        self.regen += st.regen as usize;
+        self.trace_all += st.trace_all as usize;
+        self.both += (st.regen && st.trace_all) as usize;
+        self.sum_t += s.t;
+        self.sum_q += s.qmax;
+        self.sum_k += s.prog.k();
+        self.diverse += s.emit.iter().any(|&b| b != s.emit[0]) as usize;
+    }
+    pub fn merge(&mut self, o: &Agg) {
+        self.n += o.n;
+        self.loss += o.loss;
+        self.n_flag += o.n_flag;
+        self.flag_ok += o.flag_ok;
+        self.n_tick += o.n_tick;
+        self.trace_ok += o.trace_ok;
+        self.regen += o.regen;
+        self.trace_all += o.trace_all;
+        self.both += o.both;
+        self.sum_t += o.sum_t;
+        self.sum_q += o.sum_q;
+        self.sum_k += o.sum_k;
+        self.diverse += o.diverse;
+    }
+    pub fn fid(&self) -> f64 {
+        rate(self.both, self.n)
+    }
+    pub fn regen_rate(&self) -> f64 {
+        rate(self.regen, self.n)
+    }
+    pub fn trace_rate(&self) -> f64 {
+        rate(self.trace_all, self.n)
+    }
+    pub fn byte_acc(&self) -> f64 {
+        rate(self.flag_ok, self.n_flag)
+    }
+    pub fn rule_acc(&self) -> f64 {
+        rate(self.trace_ok, self.n_tick)
+    }
+    pub fn div_rate(&self) -> f64 {
+        rate(self.diverse, self.n)
+    }
+    pub fn mean_loss(&self) -> f64 {
+        self.loss / self.n.max(1) as f64
+    }
+    pub fn mean_t(&self) -> f64 {
+        rate(self.sum_t, self.n)
+    }
+    pub fn mean_q(&self) -> f64 {
+        rate(self.sum_q, self.n)
+    }
+    pub fn mean_k(&self) -> f64 {
+        rate(self.sum_k, self.n)
+    }
+    pub fn ci(&self) -> f64 {
+        let p = self.fid();
+        1.96 * (p * (1.0 - p) / self.n.max(1) as f64).sqrt()
+    }
+}
+pub fn validate(net: &Net, pr: &Prior, n: usize, rng: &mut Rng, ws: &mut Work) -> Agg {
+    let mut a = Agg::default();
+    let mut guard = 0usize;
+    while a.n < n && guard < 100 * n.max(1) {
+        guard += 1;
+        if let Some(s) = draw_world(rng, pr, Part::Held, 1_000_000) {
+            if !nontrivial(&s) {
+                continue;
+            }
+            let st = net.run_sample(&s, 1.0, ws, None);
+            a.add(&s, &st);
+        }
+    }
+    a
+}
+pub struct ECfg {
+    pub n: usize,    
+    pub secs: f64,   
+    pub seed: u64,
+    pub gate: f64,   
+}
+pub fn axis_len(net: &Net, pr: &Prior, mults: &[usize], ec: &ECfg, ws: &mut Work) -> Vec<Agg> {
+    let t1 = pr.t_hi;
+    let mut p1 = pr.clone();
+    p1.t_lo = t1;
+    p1.t_hi = t1;
+    let mut rng = Rng::new(ec.seed ^ 0x1E17);
+    let mut out = vec![Agg::default(); mults.len()];
+    let clock = Instant::now();
+    let mut guard = 0usize;
+    while out[0].n < ec.n && guard < 400 * ec.n.max(1) && clock.elapsed().as_secs_f64() < ec.secs {
+        guard += 1;
+        let s = match draw_world(&mut rng, &p1, Part::Held, 100_000) {
+            Some(s) => s,
+            None => continue,
+        };
+        if !nontrivial(&s) {
+            continue; 
+        }
+        let mut at: Vec<Sample> = Vec::with_capacity(mults.len());
+        for &m in mults {
+            match rehorizon(&s, m * t1) {
+                Some(x) if x.qmax <= pr.q_hi => at.push(x),
+                _ => break,
+            }
+        }
+        if at.len() < mults.len() {
+            continue;
+        }
+        for (i, x) in at.iter().enumerate() {
+            let st = net.run_sample(x, 1.0, ws, None);
+            out[i].add(x, &st);
+        }
+    }
+    out
+}
+pub fn axis_depth(net: &Net, pr: &Prior, mults: &[usize], ec: &ECfg, ws: &mut Work) -> Vec<(usize, usize, Agg)> {
+    let mut out = Vec::new();
+    let mut lo = pr.q_lo;
+    for (bi, &m) in mults.iter().enumerate() {
+        let hi = m * pr.q_hi;
+        let mut pb = pr.clone();
+        pb.q_lo = lo;
+        pb.q_hi = hi;
+        let mut rng = Rng::new(ec.seed ^ (0xDE97 + bi as u64));
+        let mut a = Agg::default();
+        let clock = Instant::now();
+        let mut guard = 0usize;
+        while a.n < ec.n && guard < 400 * ec.n.max(1) && clock.elapsed().as_secs_f64() < ec.secs {
+            guard += 1;
+            if let Some(s) = draw_world(&mut rng, &pb, Part::Held, 100_000) {
+                if !nontrivial(&s) {
+                    continue;
+                }
+                let st = net.run_sample(&s, 1.0, ws, None);
+                a.add(&s, &st);
+            }
+        }
+        out.push((lo, hi, a));
+        lo = hi + 1;
+    }
+    out
+}
+pub fn totality(net: &Net, pr: &Prior, ec: &ECfg, ws: &mut Work) -> Agg {
+    let mut rng = Rng::new(ec.seed ^ 0xC0FFEE);
+    let mut a = Agg::default();
+    let clock = Instant::now();
+    let mut guard = 0usize;
+    while a.n < ec.n && guard < 200 * ec.n.max(1) && clock.elapsed().as_secs_f64() < ec.secs {
+        guard += 1;
+        if let Some(par) = draw_world(&mut rng, pr, Part::Held, 100_000) {
+            if let Some(c) = mutate_sample(&mut rng, &par, pr, 200) {
+                if in_part(&c.prog, Part::Held) && nontrivial(&c) {
+                    let st = net.run_sample(&c, 1.0, ws, None);
+                    a.add(&c, &st);
+                }
+            }
+        }
+    }
+    a
+}
+pub const MIN_N: usize = 100;
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Verdict {
+    Pass,
+    Gray,
+    Kill,
+    Inconclusive,
+}
+impl Verdict {
+    pub fn name(self) -> &'static str {
+        match self {
+            Verdict::Pass => "PASS",
+            Verdict::Gray => "GRIS",
+            Verdict::Kill => "KILL",
+            Verdict::Inconclusive => "INCONCLUSIF",
+        }
+    }
+    pub fn code(self) -> i32 {
+        match self {
+            Verdict::Pass => 0,
+            Verdict::Gray => 1,
+            Verdict::Kill => 2,
+            Verdict::Inconclusive => 3,
+        }
+    }
+    pub fn advice(self) -> &'static str {
+        match self {
+            Verdict::Pass => "D tient à 2× : « simulateur appris, extrapolable » survit à M0. Passer à M1 (garder la courbe 4× comme référence).",
+            Verdict::Gray => "Dégradation nette sans effondrement : lire le 4× et les colonnes oct/tk et règle/tk (dérive lente ou chute brutale) avant de décider.",
+            Verdict::Kill => "D s'effondre à 2× sans correctif architectural : le banc est local et le transfert meurt ici. Corriger le substrat (M0 bis) avant tout M1.",
+            Verdict::Inconclusive => "fid(1×) sous le seuil ou échantillon insuffisant : D n'a pas maîtrisé sa propre plage d'entraînement, l'extrapolation ne se juge pas. Prolonger n'aide pas s'il y a plateau : lancer `diag`, puis `train` v2 (cycles) ou changer le substrat.",
+        }
+    }
+}
+pub fn judge(a1: &Agg, a2: &Agg, gate: f64) -> Verdict {
+    let (f1, f2) = (a1.fid(), a2.fid());
+    if a1.n < MIN_N || a2.n < MIN_N || f1 < gate {
+        Verdict::Inconclusive
+    } else if f2 >= 0.8 * f1 {
+        Verdict::Pass
+    } else if f2 < 0.5 * f1 {
+        Verdict::Kill
+    } else {
+        Verdict::Gray
+    }
+}
+pub fn combine(a: Verdict, b: Verdict) -> Verdict {
+    use Verdict::*;
+    if a == Kill || b == Kill {
+        Kill
+    } else if a == Inconclusive || b == Inconclusive {
+        Inconclusive
+    } else if a == Gray || b == Gray {
+        Gray
+    } else {
+        Pass
+    }
+}
+fn head() {
+    println!(
+        "{:<15}{:>6}{:>9}{:>9}{:>9}{:>6}{:>10}{:>10}{:>7}{:>7}{:>6}{:>6}",
+        "point", "n", "régén%", "trace%", "fid%", "±", "oct/tk%", "règle/tk%", "T", "qmax", "k", "div"
+    );
+}
+fn row(label: &str, a: &Agg) {
+    println!(
+        "{:<15}{:>6}{:>9.1}{:>9.1}{:>9.1}{:>6.1}{:>10.2}{:>10.2}{:>7.1}{:>7.1}{:>6.2}{:>6.2}",
+        label,
+        a.n,
+        100.0 * a.regen_rate(),
+        100.0 * a.trace_rate(),
+        100.0 * a.fid(),
+        100.0 * a.ci(),
+        100.0 * a.byte_acc(),
+        100.0 * a.rule_acc(),
+        a.mean_t(),
+        a.mean_q(),
+        a.mean_k(),
+        a.div_rate()
+    );
+}
+pub fn report(net: &Net, ec: &ECfg, pr: &Prior) -> Verdict {
+    let mults = [1usize, 2, 4];
+    let mut ws = Work::new();
+    println!(
+        "=== M0 : fidélité de D sur programmes non vus (hash(C) mod {} = 0), mondes non triviaux (E non constant) ===",
+        HELD_MOD
+    );
+    println!(
+        "référence (1×) : T ∈ [{}, {}], qmax ≤ {}, k ≤ {} | fid = régénération exacte ∧ trace exacte | ± = IC 95 %",
+        pr.t_lo, pr.t_hi, pr.q_hi, pr.k_max
+    );
+    let al = axis_len(net, pr, &mults, ec, &mut ws);
+    println!("\nAXE LONGUEUR : mêmes programmes et mêmes vues, qmax ≤ {} jusqu'à {}×", pr.q_hi, mults[2]);
+    head();
+    for (i, a) in al.iter().enumerate() {
+        row(&format!("{}×  T={}", mults[i], mults[i] * pr.t_hi), a);
+    }
+    let ad = axis_depth(net, pr, &mults, ec, &mut ws);
+    println!("\nAXE PROFONDEUR : même plage de T [{}, {}], bins de qmax ×1 / ×2 / ×4 de {}", pr.t_lo, pr.t_hi, pr.q_hi);
+    head();
+    for (i, b) in ad.iter().enumerate() {
+        row(&format!("{}×  q∈[{},{}]", mults[i], b.0, b.1), &b.2);
+    }
+    let to = totality(net, pr, ec, &mut ws);
+    println!("\nTOTALITÉ : voisins mutés (do local) de programmes non vus, même prior");
+    head();
+    row("mutés", &to);
+    let vl = judge(&al[0], &al[1], ec.gate);
+    let vd = judge(&ad[0].2, &ad[1].2, ec.gate);
+    let v = combine(vl, vd);
+    println!("\n=== VERDICT M0 ===");
+    println!(
+        "règle : fid(1×) ≥ {:.2} requis ; PASS si fid(2×) ≥ 0,8·fid(1×) ; KILL si fid(2×) < 0,5·fid(1×) ; entre les deux : GRIS ; n ≥ {} par point",
+        ec.gate, MIN_N
+    );
+    let show = |name: &str, f: [f64; 3], vv: Verdict| {
+        println!(
+            "{:<11} fid 1× {:>5.1}%   2× {:>5.1}%   4× {:>5.1}%   (2×/1× = {:.2}, 4×/1× = {:.2})  →  {}",
+            name,
+            100.0 * f[0],
+            100.0 * f[1],
+            100.0 * f[2],
+            f[1] / f[0].max(1e-9),
+            f[2] / f[0].max(1e-9),
+            vv.name()
+        );
+    };
+    show("longueur", [al[0].fid(), al[1].fid(), al[2].fid()], vl);
+    show("profondeur", [ad[0].2.fid(), ad[1].2.fid(), ad[2].2.fid()], vd);
+    println!("GLOBAL : {}", v.name());
+    if al[0].fid() >= 0.90 && ad[0].2.fid() >= 0.90 {
+        println!(
+            "sous réserve de la porte (fid 1× ignorée ; à lire avec les ± ci-dessus) : longueur {} ; profondeur {}",
+            judge(&al[0], &al[1], 0.0).name(),
+            judge(&ad[0].2, &ad[1].2, 0.0).name()
+        );
+    }
+    println!("{}", v.advice());
+    v
+}
+pub fn compare(a: &Net, b: &Net, pr: &Prior, ec: &ECfg, depth: bool, rgate: f64) -> Verdict {
+    let mults = [1usize, 2, 4];
+    let mut ws = Work::new();
+    let mut rows: Vec<(String, Agg, Agg)> = Vec::new();
+    if depth {
+        let da = axis_depth(a, pr, &mults, ec, &mut ws);
+        let db = axis_depth(b, pr, &mults, ec, &mut ws);
+        for (i, (x, y)) in da.into_iter().zip(db.into_iter()).enumerate() {
+            rows.push((format!("{}×  q∈[{},{}]", mults[i], x.0, x.1), x.2, y.2));
+        }
+    } else {
+        let la = axis_len(a, pr, &mults, ec, &mut ws);
+        let lb = axis_len(b, pr, &mults, ec, &mut ws);
+        for (i, (x, y)) in la.into_iter().zip(lb.into_iter()).enumerate() {
+            rows.push((format!("{}×  T={}", mults[i], mults[i] * pr.t_hi), x, y));
+        }
+    }
+    println!("=== M0 / contrôle de plage d'entraînement : A (plage de référence) contre B (entraîné plus large) ===");
+    println!(
+        "référence : T ∈ [{}, {}], qmax ≤ {}, k ≤ {} | axe {} | mêmes mondes non vus pour A et B | A/B = rétention de A",
+        pr.t_lo,
+        pr.t_hi,
+        pr.q_hi,
+        pr.k_max,
+        if depth { "profondeur" } else { "longueur" }
+    );
+    println!(
+        "{:<15}{:>6}{:>9}{:>6}{:>9}{:>6}{:>9}{:>8}",
+        "point", "n", "A fid%", "±", "B fid%", "±", "B−A", "A/B"
+    );
+    for (label, x, y) in &rows {
+        println!(
+            "{:<15}{:>6}{:>9.1}{:>6.1}{:>9.1}{:>6.1}{:>9.1}{:>8.2}",
+            label,
+            x.n.min(y.n),
+            100.0 * x.fid(),
+            100.0 * x.ci(),
+            100.0 * y.fid(),
+            100.0 * y.ci(),
+            100.0 * (y.fid() - x.fid()),
+            x.fid() / y.fid().max(1e-9)
+        );
+    }
+    let (_, x, y) = &rows[1];
+    let ratio = x.fid() / y.fid().max(1e-9);
+    let v = if x.n < MIN_N || y.n < MIN_N || y.fid() < rgate {
+        Verdict::Inconclusive
+    } else if ratio >= 0.8 {
+        Verdict::Pass
+    } else if ratio < 0.5 {
+        Verdict::Kill
+    } else {
+        Verdict::Gray
+    };
+    println!(
+        "\nrègle (fixée avant mesure) : rétention A/B au point 2× ≥ 0,80 → PASS ; < 0,50 → KILL ; entre les deux → GRIS ; INCONCLUSIF si fid(B) au point 2× < {:.2} ou n < {}",
+        rgate, MIN_N
+    );
+    println!(
+        "point 2× : A {:.1} %   B {:.1} %   A/B = {:.2}   →   {}",
+        100.0 * x.fid(),
+        100.0 * y.fid(),
+        ratio,
+        v.name()
+    );
+    if depth {
+        println!("réserve : B répartit sa capacité sur plus de programmes que A, donc A/B surestime la rétention de A (lire un PASS avec prudence).");
+    } else {
+        println!("lecture : mêmes programmes, B voit seulement des ticks de plus ; si A/B ≈ 1, la chute de A à 2× est celle qu'un modèle entraîné à 2× subit aussi (capacité, pas plage).");
+    }
+    v
+}
+pub fn selfcheck() {
+    let pr = Prior::demo();
+    let mut rng = Rng::new(5);
+    let mut held_mass = 0usize;
+    for _ in 0..3000 {
+        let a = draw_world(&mut rng, &pr, Part::Train, 100_000).unwrap();
+        let b = draw_world(&mut rng, &pr, Part::Held, 100_000).unwrap();
+        assert!(in_part(&a.prog, Part::Train) && !in_part(&a.prog, Part::Held));
+        assert!(in_part(&b.prog, Part::Held) && !in_part(&b.prog, Part::Train));
+        let s = sample_world(&mut rng, &pr, 100_000).unwrap();
+        held_mass += (prog_hash(&s.prog) % HELD_MOD == 0) as usize;
+    }
+    println!(
+        "ok 1 : split disjoint ; masse « non vue » sous le prior = {:.3} (1/{} des programmes, pas forcément des tirages)",
+        held_mass as f64 / 3000.0,
+        HELD_MOD
+    );
+    let mut ext = 0usize;
+    for _ in 0..500 {
+        let s = sample_world(&mut rng, &pr, 100_000).unwrap();
+        let r = rehorizon(&s, s.t).unwrap();
+        assert_eq!(r.trace, s.trace);
+        assert_eq!(r.emit, s.emit);
+        assert_eq!(r.flag, s.flag);
+        assert_eq!(r.qmax, s.qmax);
+        if let Some(l) = rehorizon(&s, 3 * s.t) {
+            assert_eq!(&l.trace[..s.t], &s.trace[..]);
+            assert_eq!(&l.emit[..s.t], &s.emit[..]);
+            assert_eq!(&l.flag[..s.t], &s.flag[..]);
+            ext += 1;
+        }
+    }
+    println!("ok 2 : rehorizon (identité à T égal ; préfixe à 3T pour {}/500 mondes)", ext);
+    let sts = crate::train::stages(&pr);
+    for w in sts.windows(2) {
+        assert!(w[1].t_hi >= w[0].t_hi && w[1].q_hi >= w[0].q_hi);
+    }
+    let last = &sts[sts.len() - 1];
+    assert_eq!((last.t_hi, last.q_hi), (pr.t_hi, pr.q_hi));
+    println!(
+        "ok 3 : {} étages, de (T≤{}, q≤{}) à (T≤{}, q≤{})",
+        sts.len(),
+        sts[0].t_hi,
+        sts[0].q_hi,
+        last.t_hi,
+        last.q_hi
+    );
+    let net = Net::new(&mut Rng::new(3));
+    let ec = ECfg { n: 50, secs: 15.0, seed: 11, gate: 0.95 };
+    let mut ws = Work::new();
+    let t0 = Instant::now();
+    let al = axis_len(&net, &pr, &[1, 2, 4], &ec, &mut ws);
+    println!("ok 4a : axe longueur, {} mondes obtenus (demandé {}) en {:.1} s", al[0].n, ec.n, t0.elapsed().as_secs_f64());
+    let t0 = Instant::now();
+    let ad = axis_depth(&net, &pr, &[1, 2, 4], &ec, &mut ws);
+    for b in &ad {
+        println!("ok 4b : profondeur q ∈ [{},{}] : {} mondes obtenus (demandé {}), k moyen {:.2}, div {:.2}", b.0, b.1, b.2.n, ec.n, b.2.mean_k(), b.2.div_rate());
+    }
+    println!("      ({:.1} s)", t0.elapsed().as_secs_f64());
+    println!("CHECK OK");
+}
+
+
+
+========================================
+File: ./src/journal.rs
+========================================
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::path::Path;
+use memmap2::MmapMut;
+use crate::error::{Error, Result};
+const MAGIC: [u8; 8] = *b"CHRNLOG\0";
+const VERSION: u32 = 1;
+const HEADER_LEN: usize = 16;
+const FRAME_HEADER: usize = 16;
+const MAX_PAYLOAD: usize = 16 << 20;
+const MIN_CAPACITY: usize = 4096;
+const DEFAULT_CAPACITY: u64 = 1 << 20;
+const INDEX_STRIDE: u64 = 1024;
+#[derive(Debug, Clone, Copy)]
+pub struct Frame<'a> {
+    pub seq: u64,
+    pub payload: &'a [u8],
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Recovery {
+    pub frames: u64,
+    pub discarded_bytes: u64,
+}
+pub struct Journal {
+    file: File,
+    map: MmapMut,
+    tail: usize,
+    synced: usize,
+    next_seq: u64,
+    index: Vec<usize>,
+}
+impl Journal {
+    pub fn open(path: impl AsRef<Path>) -> Result<(Self, Recovery)> {
+        Self::open_with_capacity(path, DEFAULT_CAPACITY)
+    }
+    pub fn open_with_capacity(path: impl AsRef<Path>, capacity: u64) -> Result<(Self, Recovery)> {
+        let path = path.as_ref();
+        let file = OpenOptions::new().read(true).write(true).create(true).open(path)?;
+        lock_exclusive(&file)?;
+        let existing = file.metadata()?.len();
+        if existing == 0 {
+            file.set_len(capacity.max(MIN_CAPACITY as u64))?;
+        } else if existing < HEADER_LEN as u64 {
+            return Err(Error::BadHeader("file shorter than header"));
+        }
+        let mut map = unsafe { MmapMut::map_mut(&file)? };
+        if map[..HEADER_LEN].iter().all(|&b| b == 0) {
+            map[0..8].copy_from_slice(&MAGIC);
+            map[8..12].copy_from_slice(&VERSION.to_le_bytes());
+            map.flush_range(0, HEADER_LEN)?;
+            file.sync_all()?;
+            sync_parent_dir(path)?;
+        } else {
+            if map[0..8] != MAGIC[..] {
+                return Err(Error::BadHeader("bad magic"));
+            }
+            let version = u32::from_le_bytes(map[8..12].try_into().unwrap());
+            if version != VERSION {
+                return Err(Error::BadHeader("unsupported version"));
+            }
+        }
+        let scan = scan_frames(&map);
+        let discarded = scrub_tail(&mut map, scan.tail);
+        if discarded > 0 {
+            map.flush_range(scan.tail, discarded)?;
+        }
+        let recovery = Recovery { frames: scan.next_seq - 1, discarded_bytes: discarded as u64 };
+        let journal = Journal {
+            file,
+            map,
+            tail: scan.tail,
+            synced: scan.tail,
+            next_seq: scan.next_seq,
+            index: scan.index,
+        };
+        Ok((journal, recovery))
+    }
+    pub fn append(&mut self, payload: &[u8]) -> Result<u64> {
+        if payload.len() > MAX_PAYLOAD {
+            return Err(Error::PayloadTooLarge(payload.len()));
+        }
+        let need = FRAME_HEADER + payload.len();
+        if self.tail + need > self.map.len() {
+            self.grow(need)?;
+        }
+        let (off, seq) = (self.tail, self.next_seq);
+        let body = off + FRAME_HEADER;
+        let len = payload.len() as u32;
+        let mut header = [0u8; FRAME_HEADER];
+        header[0..4].copy_from_slice(&len.to_le_bytes());
+        header[4..8].copy_from_slice(&frame_crc(len, seq, payload).to_le_bytes());
+        header[8..16].copy_from_slice(&seq.to_le_bytes());
+        self.map[body..body + payload.len()].copy_from_slice(payload);
+        self.map[off..body].copy_from_slice(&header);
+        if (seq - 1) % INDEX_STRIDE == 0 {
+            self.index.push(off);
+        }
+        self.tail = body + payload.len();
+        self.next_seq += 1;
+        Ok(seq)
+    }
+    pub fn sync(&mut self) -> Result<()> {
+        if self.tail > self.synced {
+            self.map.flush_range(self.synced, self.tail - self.synced)?;
+            self.synced = self.tail;
+        }
+        Ok(())
+    }
+    pub fn last_seq(&self) -> u64 {
+        self.next_seq - 1
+    }
+    pub fn tail(&self) -> u64 {
+        self.tail as u64
+    }
+    pub fn frames(&self) -> Frames<'_> {
+        Frames { buf: &self.map[..self.tail], off: HEADER_LEN }
+    }
+    pub fn frames_from(&self, seq: u64) -> Frames<'_> {
+        let seq = seq.max(1);
+        let buf = &self.map[..self.tail];
+        if seq >= self.next_seq {
+            return Frames { buf, off: buf.len() };
+        }
+        let mut it = Frames { buf, off: self.index[((seq - 1) / INDEX_STRIDE) as usize] };
+        for _ in 0..(seq - 1) % INDEX_STRIDE {
+            it.next();
+        }
+        it
+    }
+    fn grow(&mut self, need: usize) -> Result<()> {
+        let wanted = self.tail + need;
+        let mut cap = self.map.len().max(MIN_CAPACITY);
+        while cap < wanted {
+            cap *= 2;
+        }
+        self.file.set_len(cap as u64)?;
+        self.file.sync_data()?; 
+        self.map = unsafe { MmapMut::map_mut(&self.file)? };
+        Ok(())
+    }
+}
+pub struct Frames<'a> {
+    buf: &'a [u8],
+    off: usize,
+}
+impl<'a> Iterator for Frames<'a> {
+    type Item = Frame<'a>;
+    fn next(&mut self) -> Option<Frame<'a>> {
+        let (len, _crc, seq) = read_header(self.buf, self.off)?;
+        let body = self.off + FRAME_HEADER;
+        let payload = self.buf.get(body..body.checked_add(len)?)?;
+        self.off = body + len;
+        Some(Frame { seq, payload })
+    }
+}
+fn read_header(buf: &[u8], off: usize) -> Option<(usize, u32, u64)> {
+    let h = buf.get(off..off.checked_add(FRAME_HEADER)?)?;
+    let len = u32::from_le_bytes(h[0..4].try_into().ok()?) as usize;
+    let crc = u32::from_le_bytes(h[4..8].try_into().ok()?);
+    let seq = u64::from_le_bytes(h[8..16].try_into().ok()?);
+    Some((len, crc, seq))
+}
+fn frame_crc(len: u32, seq: u64, payload: &[u8]) -> u32 {
+    let mut h = crc32fast::Hasher::new();
+    h.update(&len.to_le_bytes());
+    h.update(&seq.to_le_bytes());
+    h.update(payload);
+    h.finalize()
+}
+struct Scan {
+    tail: usize,
+    next_seq: u64,
+    index: Vec<usize>,
+}
+fn scan_frames(buf: &[u8]) -> Scan {
+    let (mut off, mut next_seq, mut index) = (HEADER_LEN, 1u64, Vec::new());
+    while let Some((len, crc, seq)) = read_header(buf, off) {
+        if seq != next_seq || len > MAX_PAYLOAD {
+            break;
+        }
+        let body = off + FRAME_HEADER;
+        let Some(payload) = buf.get(body..body + len) else { break };
+        if frame_crc(len as u32, seq, payload) != crc {
+            break;
+        }
+        if (seq - 1) % INDEX_STRIDE == 0 {
+            index.push(off);
+        }
+        off = body + len;
+        next_seq += 1;
+    }
+    Scan { tail: off, next_seq, index }
+}
+fn scrub_tail(map: &mut [u8], from: usize) -> usize {
+    const CHUNK: usize = 4096;
+    let (mut off, mut dirty_end) = (from, from);
+    while off < map.len() {
+        let end = (off + CHUNK).min(map.len());
+        if let Some(last) = map[off..end].iter().rposition(|&b| b != 0) {
+            dirty_end = off + last + 1;
+            map[off..end].fill(0);
+        }
+        off = end;
+    }
+    dirty_end - from
+}
+#[cfg(unix)]
+fn lock_exclusive(file: &File) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    Err(if err.kind() == io::ErrorKind::WouldBlock { Error::Locked } else { Error::Io(err) })
+}
+#[cfg(not(unix))]
+fn lock_exclusive(_: &File) -> Result<()> {
+    Ok(())
+}
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+#[cfg(not(unix))]
+fn sync_parent_dir(_: &Path) -> Result<()> {
+    Ok(())
+}
+
+
+
+========================================
+File: ./src/kv.rs
+========================================
+use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use crate::StateMachine;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KvEvent {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+}
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Kv {
+    map: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+impl Kv {
+    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        self.map.get(key).map(Vec::as_slice)
+    }
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.map.iter().map(|(k, v)| (k.as_slice(), v.as_slice()))
+    }
+}
+impl StateMachine for Kv {
+    type Event = KvEvent;
+    fn genesis() -> Self {
+        Self::default()
+    }
+    fn apply(&mut self, event: &KvEvent) {
+        match event {
+            KvEvent::Put { key, value } => {
+                self.map.insert(key.clone(), value.clone());
+            }
+            KvEvent::Delete { key } => {
+                self.map.remove(key);
+            }
+        }
+    }
+}
+
+
+
+========================================
+File: ./src/lib.rs
+========================================
+mod cursor;
+mod engine;
+mod error;
+mod journal;
+mod snapshot;
+pub mod kv;
+#[cfg(target_os = "linux")]
+mod oneshot;
+#[cfg(target_os = "linux")]
+mod runtime;
+#[cfg(target_os = "linux")]
+mod sys;
+pub use cursor::Cursor;
+pub use engine::{Engine, Options, StateMachine};
+pub use error::{Error, Result};
+pub use journal::{Frame, Frames, Journal, Recovery};
+#[cfg(target_os = "linux")]
+pub use runtime::{block_on, Ctx, Handle, Pending, Server, Stats};
+
+
+
+========================================
+File: ./src/main.rs
+========================================
+mod meta;
+mod rng;
+mod net;
+mod eval;
+mod train;
+mod diag;
+mod sizes;
+mod tape;
+use meta::*;
+use rng::Rng;
+fn selftest() {
+    let (a, b) = (b'a', b'b');
+    let rep = Program { m: 1, bytes: vec![a, b], prod: vec![vec![0], vec![1]], q0: vec![0, 1] };
+    let alt = Program { m: 1, bytes: vec![a, b], prod: vec![vec![1], vec![0]], q0: vec![0] };
+    let er = emit_of(&rep, &run(&rep, 10).unwrap().trace);
+    let ea = emit_of(&alt, &run(&alt, 10).unwrap().trace);
+    assert_eq!(er, b"ababababab".to_vec());
+    assert_eq!(ea, er);
+    println!("ok 1 : {}  et  {}  →  {}", rep.show(), alt.show(), text(&er));
+    let t2 = Program { m: 2, bytes: vec![a, b], prod: vec![vec![0, 1], vec![1]], q0: vec![0, 1] };
+    let r2 = run(&t2, 4).unwrap();
+    assert_eq!(r2.trace, vec![0, 0, 0, 0]);
+    assert_eq!(r2.qmax, 2);
+    assert_eq!(r2.fired, 1);
+    println!("ok 2 : 2-tag");
+    let dead = Program { m: 1, bytes: vec![a], prod: vec![vec![]], q0: vec![0] };
+    assert!(run(&dead, 1).is_some());
+    assert!(run(&dead, 2).is_none());
+    println!("ok 3 : file épuisée détectée");
+    let pr = Prior::demo();
+    let mut rng = Rng::new(7);
+    let mut tot_att = 0u64;
+    let n = 2000;
+    for _ in 0..n {
+        let s = sample_world(&mut rng, &pr, 100_000).expect("monde");
+        tot_att += s.attempts as u64;
+        assert_eq!(s.trace.len(), s.t);
+        assert_eq!(s.emit.len(), s.t);
+        assert!(s.flag.iter().any(|&f| f));
+        let k = s.prog.k();
+        assert_eq!(run(&s.prog, s.t).unwrap().fired, (1u32 << k) - 1);
+        let mut z = vec![0.0f32; Z_DIM];
+        encode(&s.prog, &s.view, &mut z);
+        for j in 0..K_MAX {
+            let base = 2 + j * ROW;
+            for sl in 0..W_MAX {
+                let lo = base + 9 + sl * NSLOT;
+                let sum: f32 = z[lo..lo + NSLOT].iter().sum();
+                assert_eq!(sum, if j < k { 1.0 } else { 0.0 });
+            }
+        }
+        let qb = 2 + K_MAX * ROW;
+        for sl in 0..Q_MAX {
+            let sum: f32 = z[qb + sl * NSLOT..qb + (sl + 1) * NSLOT].iter().sum();
+            assert_eq!(sum, 1.0);
+        }
+        assert_eq!(z[H_DIM..H_DIM + 3].iter().sum::<f32>(), 1.0);
+        assert_eq!(z[H_DIM + 3..H_DIM + 7].iter().sum::<f32>(), 1.0);
+        let mut bits = 0.0;
+        let np = mutate(&mut rng, &s.prog, &mut bits);
+        assert!(np != s.prog && bits > 0.0);
+    }
+    println!("ok 4 : {} mondes, tentatives moyennes par monde accepté = {:.2}", n, tot_att as f64 / n as f64);
+    let (mut r1, mut r2) = (Rng::new(42), Rng::new(42));
+    let s1 = sample_world(&mut r1, &pr, 100_000).unwrap();
+    let s2 = sample_world(&mut r2, &pr, 100_000).unwrap();
+    assert_eq!(s1.prog, s2.prog);
+    assert_eq!(s1.trace, s2.trace);
+    println!("ok 5 : déterminisme\nSELFTEST OK");
+}
+fn selftest_trunc() {
+    let (a, b) = (b'a', b'b');
+    let g = Program { m: 1, bytes: vec![a, b], prod: vec![vec![0, 0, 1], vec![]], q0: vec![0] };
+    assert_eq!(sizes::queue_lens(&g, 4), vec![1, 3, 5, 7]);
+    assert_eq!(run_cap(&g, 10, 6).unwrap().trace, vec![0, 0, 0]);
+    let rep = Program { m: 1, bytes: vec![a, b], prod: vec![vec![0], vec![1]], q0: vec![0, 1] };
+    assert_eq!(run_cap(&rep, 9, 6).unwrap().trace, run(&rep, 9).unwrap().trace);
+    let dead = Program { m: 1, bytes: vec![a], prod: vec![vec![]], q0: vec![0] };
+    assert!(run_cap(&dead, 2, 6).is_none());
+    println!("ok 1 : run_cap");
+    let mut pr = Prior::demo();
+    pr.trunc = true;
+    pr.q_hi = 3;
+    let mut rng = Rng::new(11);
+    let mut tot_att = 0u64;
+    let n = 3000;
+    for _ in 0..n {
+        let s = sample_world(&mut rng, &pr, 100_000).expect("monde");
+        tot_att += s.attempts as u64;
+        assert!(s.t >= 1 && s.t > s.view.o && s.flag.iter().any(|&f| f));
+        assert_eq!(run(&s.prog, s.t).unwrap().trace, s.trace);
+        assert!(sizes::queue_lens(&s.prog, s.t).iter().all(|&l| l <= pr.q_hi));
+        if let Some(c) = mutate_sample(&mut rng, &s, &pr, 200) {
+            assert!(c.t >= 1 && c.t > c.view.o && c.t <= s.t);
+            assert_eq!(run(&c.prog, c.t).unwrap().trace, c.trace);
+            assert!(sizes::queue_lens(&c.prog, c.t).iter().all(|&l| l <= pr.q_hi));
+        }
+    }
+    println!("ok 2 : {} mondes tronqués (q ≤ {}), tentatives moyennes {:.2}", n, pr.q_hi, tot_att as f64 / n as f64);
+    println!("TCHECK OK");
+}
+fn monde(args: &[String]) {
+    let seed: u64 = args.get(0).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(8);
+    let pr = Prior::demo();
+    let mut rng = Rng::new(seed);
+    for _ in 0..n {
+        let s = sample_world(&mut rng, &pr, 100_000).unwrap();
+        let fl: String = s.flag.iter().map(|&f| if f { '#' } else { '.' }).collect();
+        println!("{}", s.prog.show());
+        println!("  E   = {}", text(&s.emit));
+        println!("  vue = {}  (o={}, s={})  T={}  qmax={}", fl, s.view.o, s.view.s, s.t, s.qmax);
+        println!("  |p|={:.1} b  |V|={:.1} b  |T|={:.1} b  tentatives={}", s.bits_p, s.bits_v, s.bits_t, s.attempts);
+        if let Some(c) = mutate_sample(&mut rng, &s, &pr, 200) {
+            println!("  mut = {}\n  E'  = {}  (|p'|={:.1} b)", c.prog.show(), text(&c.emit), c.bits_p);
+        }
+    }
+}
+fn arg<T: std::str::FromStr>(a: &[String], i: usize, d: T) -> T {
+    a.get(i).and_then(|s| s.parse::<T>().ok()).unwrap_or(d)
+}
+fn opt<T: std::str::FromStr>(a: &[String], key: &str, d: T) -> T {
+    a.windows(2)
+        .find(|w| w[0] == key)
+        .and_then(|w| w[1].parse::<T>().ok())
+        .unwrap_or(d)
+}
+fn ecfg(a: &[String]) -> eval::ECfg {
+    eval::ECfg {
+        n: opt(a, "--n", 2000usize),
+        secs: opt(a, "--esecs", 120.0f64),
+        seed: opt(a, "--eseed", 9001u64),
+        gate: opt(a, "--gate", 0.95f64),
+    }
+}
+fn load_or_exit(path: &str) -> tape::Net {
+    match tape::Net::load(path) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("{} : {}", path, e);
+            std::process::exit(1);
+        }
+    }
+}
+fn ref_prior(a: &[String], path: &str) -> Prior {
+    let mut p = Prior::demo();
+    if let Some((t, q, k)) = train::load_ref(path) {
+        p.t_hi = t;
+        p.q_hi = q;
+        p.k_max = k;
+    }
+    p.t_hi = opt(a, "--thi", p.t_hi);
+    p.q_hi = opt(a, "--qhi", p.q_hi);
+    p.k_max = opt(a, "--kmax", p.k_max).clamp(1, K_MAX);
+    p
+}
+fn cmd_train(a: &[String]) {
+    let threads_def = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let d = Prior::demo();
+    let fixed = if a.iter().any(|x| x.as_str() == "--thi" || x.as_str() == "--qhi") {
+        Some((opt(a, "--thi", d.t_hi), opt(a, "--qhi", d.q_hi)))
+    } else {
+        None
+    };
+    let cfg = train::Cfg {
+        seed: opt(a, "--seed", 1u64),
+        steps: opt(a, "--steps", 400_000usize),
+        batch: opt(a, "--batch", 64usize),
+        threads: opt(a, "--threads", threads_def),
+        lr: opt(a, "--lr", 2e-3f64),
+        lr_min: opt(a, "--lrmin", 1e-4f64),
+        cycle: opt(a, "--cycle", 8000usize),
+        max_cycles: opt(a, "--maxcyc", 4usize),
+        peak_decay: opt(a, "--peakdecay", 0.7f64),
+        clip: opt(a, "--clip", 1.0f64),
+        w_trace: opt(a, "--wtrace", 1.0f64),
+        mut_frac: opt(a, "--mut", 0.25f64),
+        up: opt(a, "--up", 0.90f64),
+        gate: opt(a, "--gate", 0.95f64),
+        every: opt(a, "--every", 1000usize),
+        n_val: opt(a, "--nval", 500usize),
+        n_gate: opt(a, "--ngate", 3000usize),
+        secs: opt(a, "--secs", 0.0f64),
+        from: opt(a, "--from", 1usize).saturating_sub(1),
+        kmax: opt(a, "--kmax", d.k_max).clamp(1, K_MAX),
+        fixed,
+        out: opt(a, "--out", "m0d.bin".to_string()),
+        init: opt(a, "--init", String::new()),
+        lr_stage: opt(a, "--lrstage", 5e-4f64),
+        warm: opt(a, "--warm", 300usize),
+        rho: opt(a, "--rho", 1.2f64),
+        trunc: a.iter().any(|x| x.as_str() == "--trunc"),
+    };
+    let (net, pr) = train::train(&cfg);
+    println!("modèle : {} (plage : T ≤ {}, qmax ≤ {}, k ≤ {})\n", cfg.out, pr.t_hi, pr.q_hi, pr.k_max);
+    let mut ev = pr.clone();
+    ev.trunc = false; 
+    let v = eval::report(&net, &ecfg(a), &ev);
+    std::process::exit(v.code());
+}
+fn cmd_eval(a: &[String]) {
+    let path: String = opt(a, "--model", "m0d.bin".to_string());
+    let net = load_or_exit(&path);
+    let pr = ref_prior(a, &path);
+    let v = eval::report(&net, &ecfg(a), &pr);
+    std::process::exit(v.code());
+}
+fn cmd_diag(a: &[String]) {
+    let path: String = opt(a, "--model", "m0d.bin".to_string());
+    let net = load_or_exit(&path);
+    let pr = ref_prior(a, &path);
+    diag::run(
+        &net,
+        &pr,
+        opt(a, "--n", 4000usize),
+        opt(a, "--eseed", 9001u64),
+        opt(a, "--horizon", 0usize),
+    );
+}
+fn cmd_cmp(a: &[String]) {
+    let pa: String = opt(a, "--a", "out/m1.bin".to_string());
+    let pb: String = opt(a, "--b", "out/m1_t12.bin".to_string());
+    let depth = opt(a, "--axis", "len".to_string()) == "depth";
+    let rgate: f64 = opt(a, "--rgate", 0.30f64);
+    let na = load_or_exit(&pa);
+    let nb = load_or_exit(&pb);
+    let pr = ref_prior(a, &pa);
+    println!("A : {} (plage T ≤ {}, qmax ≤ {}, k ≤ {})", pa, pr.t_hi, pr.q_hi, pr.k_max);
+    match train::load_ref(&pb) {
+        Some((t, q, k)) => {
+            println!("B : {} (plage T ≤ {}, qmax ≤ {}, k ≤ {})", pb, t, q, k);
+            let wider = if depth { q > pr.q_hi } else { t > pr.t_hi };
+            if !wider || k != pr.k_max {
+                eprintln!(
+                    "attention : B doit être plus large que A sur l'axe testé, à même k_max ; sinon le contrôle ne mesure rien"
+                );
+            }
+        }
+        None => eprintln!("attention : {}.ref absent, plage de B inconnue", pb),
+    }
+    let v = eval::compare(&na, &nb, &pr, &ecfg(a), depth, rgate);
+    std::process::exit(v.code());
+}
+fn cmd_sizes(a: &[String]) {
+    let path: String = opt(a, "--model", "out/m2.bin".to_string());
+    let net = load_or_exit(&path);
+    let d = Prior::demo();
+    let (t, q, k) = train::load_ref(&path).unwrap_or((d.t_hi, d.q_hi, d.k_max));
+    let mut pr = d;
+    pr.t_hi = opt(a, "--thi", t);
+    pr.k_max = opt(a, "--kmax", k).clamp(1, K_MAX);
+    pr.q_hi = opt(a, "--qhi", 4 * q);
+    sizes::run(&net, &pr, opt(a, "--qtrain", q), opt(a, "--n", 6000usize), opt(a, "--eseed", 9001u64));
+}
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("selftest") => selftest(),
+        Some("monde") => monde(&args[2..]),
+        Some("gradcheck") => {
+            if !net::gradcheck(arg(&args, 2, 1u64)) {
+                std::process::exit(1);
+            }
+        }
+        Some("overfit") => net::overfit(arg(&args, 2, 1u64)),
+        Some("check") => eval::selfcheck(),
+        Some("train") => cmd_train(&args[2..]),
+        Some("eval") => cmd_eval(&args[2..]),
+        Some("diag") => cmd_diag(&args[2..]),
+        Some("cmp") => cmd_cmp(&args[2..]),
+        Some("sizes") => cmd_sizes(&args[2..]),
+        Some("tgrad") => {
+            if !tape::gradcheck(arg(&args, 2, 1u64)) {
+                std::process::exit(1);
+            }
+        },
+        Some("tcheck") => selftest_trunc(),
+        _ => eprintln!(
+            "usage : selftest | monde [seed] [n] | gradcheck [seed] | overfit [seed] | check | train [--opts] | eval [--opts] | diag [--opts] | cmp [--opts] | sizes [--opts]"
+        ),
+    }
+}
+
+
+
+========================================
+File: ./src/meta.rs
+========================================
+use crate::rng::Rng;
+use std::collections::VecDeque;
+pub const K_MAX: usize = 6; 
+pub const W_MAX: usize = 3; 
+pub const Q_MAX: usize = 3; 
+pub const NSLOT: usize = K_MAX + 1; 
+pub const NONE: usize = K_MAX;
+pub const ROW: usize = 8 + 1 + W_MAX * NSLOT; 
+pub const H_DIM: usize = 2 + K_MAX * ROW + Q_MAX * NSLOT; 
+pub const V_DIM: usize = 3 + 4; 
+pub const Z_DIM: usize = H_DIM + V_DIM; 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Program {
+    pub m: usize,
+    pub bytes: Vec<u8>,
+    pub prod: Vec<Vec<u8>>,
+    pub q0: Vec<u8>,
+}
+fn glyph(b: u8) -> char {
+    if (0x20..0x7f).contains(&b) { b as char } else { '?' }
+}
+pub fn text(b: &[u8]) -> String {
+    b.iter().map(|&x| glyph(x)).collect()
+}
+impl Program {
+    pub fn k(&self) -> usize {
+        self.bytes.len()
+    }
+    pub fn show(&self) -> String {
+        let s = |v: &[u8]| -> String { v.iter().map(|&j| glyph(self.bytes[j as usize])).collect() };
+        let rules: Vec<String> = (0..self.k())
+            .map(|j| {
+                let w = s(&self.prod[j]);
+                format!("{}→{}", glyph(self.bytes[j]), if w.is_empty() { "ε".to_string() } else { w })
+            })
+            .collect();
+        format!("m={} q0={} [{}]", self.m, s(&self.q0), rules.join(" "))
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct View {
+    pub o: usize, 
+    pub s: usize, 
+}
+#[derive(Clone, Debug)]
+pub struct Prior {
+    pub pool: usize,              
+    pub k_max: usize,             
+    pub q0_max: usize,            
+    pub m2: f64,                  
+    pub w1: [f64; W_MAX + 1],     
+    pub w2: [f64; W_MAX + 1],     
+    pub t_lo: usize,              
+    pub t_hi: usize,
+    pub q_lo: usize,              
+    pub q_hi: usize,
+    pub need_all_fired: bool,     
+    pub trunc: bool, 
+}
+impl Prior {
+    pub fn demo() -> Prior {
+        Prior {
+            pool: 26, k_max: 4, q0_max: 3, m2: 0.3,
+            w1: [0.1, 0.6, 0.2, 0.1], w2: [0.1, 0.2, 0.5, 0.2],
+            t_lo: 4, t_hi: 16, q_lo: 1, q_hi: 6, need_all_fired: true,
+            trunc: false,
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub struct Sample {
+    pub prog: Program,
+    pub view: View,
+    pub t: usize,
+    pub trace: Vec<u8>, 
+    pub emit: Vec<u8>,  
+    pub flag: Vec<bool>, 
+    pub qmax: usize,
+    pub bits_p: f64, 
+    pub bits_v: f64, 
+    pub bits_t: f64, 
+    pub attempts: u32, 
+}
+pub fn sample_program(rng: &mut Rng, pr: &Prior, bits: &mut f64) -> Program {
+    let k_cap = pr.k_max.min(K_MAX).min(pr.pool);
+    let k = rng.range(1, k_cap);
+    *bits += (k_cap as f64).log2();
+    let mut pool: Vec<u8> = (0..pr.pool).map(|i| ((b'a' as usize + i) % 256) as u8).collect();
+    let mut bytes = Vec::with_capacity(k);
+    for _ in 0..k {
+        let i = rng.below(pool.len());
+        *bits += (pool.len() as f64).log2();
+        bytes.push(pool.swap_remove(i));
+    }
+    let m = if rng.bernoulli(pr.m2) { 2 } else { 1 };
+    *bits += if m == 2 { -pr.m2.log2() } else { -(1.0 - pr.m2).log2() };
+    let ql_cap = pr.q0_max.min(Q_MAX);
+    let ql = rng.range(1, ql_cap);
+    *bits += (ql_cap as f64).log2();
+    let mut q0 = Vec::with_capacity(ql);
+    for _ in 0..ql {
+        q0.push(rng.below(k) as u8);
+        *bits += (k as f64).log2();
+    }
+    let wp = if m == 2 { &pr.w2 } else { &pr.w1 };
+    let wtot: f64 = wp.iter().sum();
+    let mut prod = Vec::with_capacity(k);
+    for _ in 0..k {
+        let l = rng.categorical(wp);
+        *bits += -(wp[l] / wtot).log2();
+        let mut w = Vec::with_capacity(l);
+        for _ in 0..l {
+            w.push(rng.below(k) as u8);
+            *bits += (k as f64).log2();
+        }
+        prod.push(w);
+    }
+    Program { m, bytes, prod, q0 }
+}
+pub fn sample_view(rng: &mut Rng, bits: &mut f64) -> View {
+    let o = rng.below(4);
+    let s = 1 + rng.below(3);
+    *bits += 2.0 + 3f64.log2();
+    View { o, s }
+}
+pub struct Run {
+    pub trace: Vec<u8>,
+    pub qmax: usize,
+    pub fired: u32, 
+}
+pub fn run(p: &Program, t: usize) -> Option<Run> {
+    let mut q: VecDeque<u8> = p.q0.iter().copied().collect();
+    let mut qmax = q.len();
+    let mut trace = Vec::with_capacity(t);
+    let mut fired: u32 = 0;
+    for _ in 0..t {
+        if q.len() < p.m {
+            return None;
+        }
+        let j = q.pop_front()?;
+        for _ in 1..p.m {
+            let _ = q.pop_front();
+        }
+        trace.push(j);
+        fired |= 1u32 << (j as u32);
+        for &x in &p.prod[j as usize] {
+            q.push_back(x);
+        }
+        if q.len() > qmax {
+            qmax = q.len();
+        }
+    }
+    Some(Run { trace, qmax, fired })
+}
+pub fn run_cap(p: &Program, t: usize, cap: usize) -> Option<Run> {
+    let mut q: VecDeque<u8> = p.q0.iter().copied().collect();
+    let mut qmax = q.len();
+    let mut trace = Vec::with_capacity(t);
+    let mut fired: u32 = 0;
+    for _ in 0..t {
+        if q.len() > cap {
+            break;
+        }
+        if q.len() < p.m {
+            return None;
+        }
+        let j = q.pop_front()?;
+        for _ in 1..p.m {
+            let _ = q.pop_front();
+        }
+        trace.push(j);
+        fired |= 1u32 << (j as u32);
+        for &x in &p.prod[j as usize] {
+            q.push_back(x);
+        }
+        if q.len() > qmax {
+            qmax = q.len();
+        }
+    }
+    Some(Run { trace, qmax, fired })
+}
+pub fn emit_of(p: &Program, trace: &[u8]) -> Vec<u8> {
+    trace.iter().map(|&j| p.bytes[j as usize]).collect()
+}
+#[allow(clippy::too_many_arguments)]
+fn finish(p: Program, view: View, t: usize, r: Run, bp: f64, bv: f64, bt: f64, att: u32) -> Sample {
+    let emit = emit_of(&p, &r.trace);
+    let flag: Vec<bool> = (0..t).map(|i| i >= view.o && (i - view.o) % view.s == 0).collect();
+    Sample { prog: p, view, t, trace: r.trace, emit, flag, qmax: r.qmax, bits_p: bp, bits_v: bv, bits_t: bt, attempts: att }
+}
+pub fn sample_world(rng: &mut Rng, pr: &Prior, max_attempts: u32) -> Option<Sample> {
+    for a in 1..=max_attempts {
+        let (mut bp, mut bv) = (0.0f64, 0.0f64);
+        let p = sample_program(rng, pr, &mut bp);
+        let t = rng.range(pr.t_lo, pr.t_hi);
+        let bt = ((pr.t_hi - pr.t_lo + 1) as f64).log2();
+        let view = sample_view(rng, &mut bv);
+        let r = match run(&p, t) {
+            Some(r) => r,
+            None => continue,
+        };
+        if pr.need_all_fired && r.fired != (1u32 << p.k()) - 1 {
+            continue;
+        }
+        if pr.trunc {
+            let rc = match run_cap(&p, t, pr.q_hi) {
+                Some(rc) => rc,
+                None => continue,
+            };
+            let te = rc.trace.len();
+            if te == 0 || te <= view.o {
+                continue; 
+            }
+            return Some(finish(p, view, te, rc, bp, bv, bt, a));
+        }
+        if r.qmax < pr.q_lo || r.qmax > pr.q_hi {
+            continue;
+        }
+        return Some(finish(p, view, t, r, bp, bv, bt, a));
+    }
+    None
+}
+enum Edit {
+    Q0Sub(usize, u8),
+    ProdSub(usize, usize, u8),
+    ProdIns(usize, usize, u8),
+    ProdDel(usize, usize),
+    FlipM,
+}
+pub fn mutate(rng: &mut Rng, p: &Program, bits: &mut f64) -> Program {
+    let k = p.k();
+    let mut ed: Vec<Edit> = Vec::new();
+    for i in 0..p.q0.len() {
+        for x in 0..k as u8 {
+            if x != p.q0[i] {
+                ed.push(Edit::Q0Sub(i, x));
+            }
+        }
+    }
+    for j in 0..k {
+        for i in 0..p.prod[j].len() {
+            for x in 0..k as u8 {
+                if x != p.prod[j][i] {
+                    ed.push(Edit::ProdSub(j, i, x));
+                }
+            }
+            ed.push(Edit::ProdDel(j, i));
+        }
+        if p.prod[j].len() < W_MAX {
+            for i in 0..=p.prod[j].len() {
+                for x in 0..k as u8 {
+                    ed.push(Edit::ProdIns(j, i, x));
+                }
+            }
+        }
+    }
+    ed.push(Edit::FlipM);
+    *bits += (ed.len() as f64).log2();
+    let mut np = p.clone();
+    match ed[rng.below(ed.len())] {
+        Edit::Q0Sub(i, x) => np.q0[i] = x,
+        Edit::ProdSub(j, i, x) => np.prod[j][i] = x,
+        Edit::ProdIns(j, i, x) => np.prod[j].insert(i, x),
+        Edit::ProdDel(j, i) => {
+            np.prod[j].remove(i);
+        }
+        Edit::FlipM => np.m = 3 - np.m,
+    }
+    np
+}
+pub fn mutate_sample(rng: &mut Rng, par: &Sample, pr: &Prior, max_attempts: u32) -> Option<Sample> {
+    for a in 1..=max_attempts {
+        let mut bp = par.bits_p;
+        let np = mutate(rng, &par.prog, &mut bp);
+        if pr.trunc {
+            if let Some(r) = run_cap(&np, par.t, pr.q_hi) {
+                let te = r.trace.len();
+                if te > 0 && te > par.view.o {
+                    return Some(finish(np, par.view, te, r, bp, par.bits_v, par.bits_t, a));
+                }
+            }
+            continue;
+        }
+        if let Some(r) = run(&np, par.t) {
+            if r.qmax > pr.q_hi {
+                continue;
+            }
+            return Some(finish(np, par.view, par.t, r, bp, par.bits_v, par.bits_t, a));
+        }
+    }
+    None
+}
+pub fn encode(p: &Program, v: &View, z: &mut [f32]) {
+    assert_eq!(z.len(), Z_DIM);
+    for x in z.iter_mut() {
+        *x = 0.0;
+    }
+    z[p.m - 1] = 1.0;
+    for j in 0..p.k() {
+        let base = 2 + j * ROW;
+        let b = p.bytes[j];
+        for i in 0..8 {
+            z[base + i] = if (b >> i) & 1 == 1 { 1.0 } else { -1.0 };
+        }
+        z[base + 8] = 1.0;
+        for s in 0..W_MAX {
+            let idx = if s < p.prod[j].len() { p.prod[j][s] as usize } else { NONE };
+            z[base + 9 + s * NSLOT + idx] = 1.0;
+        }
+    }
+    let qb = 2 + K_MAX * ROW;
+    for s in 0..Q_MAX {
+        let idx = if s < p.q0.len() { p.q0[s] as usize } else { NONE };
+        z[qb + s * NSLOT + idx] = 1.0;
+    }
+    z[H_DIM + v.s - 1] = 1.0;
+    z[H_DIM + 3 + v.o] = 1.0;
+}
+
+
+
+========================================
+File: ./src/net.rs
+========================================
+#![allow(dead_code)]
+use crate::meta::{encode, sample_world, Prior, Sample, K_MAX, Z_DIM};
+use crate::rng::Rng;
+use std::time::Instant;
+pub const ND: usize = 16; 
+pub const NN: usize = 12; 
+pub const NU: usize = ND * NN; 
+const BB: usize = ND * ND;
+pub const NB: usize = 8; 
+pub const NOUT: usize = NB + K_MAX; 
+pub const SELF_LOOPS: bool = true;
+pub fn edges() -> Vec<(usize, usize)> {
+    let mut e = Vec::new();
+    for a in 0..NN {
+        for b in a + 1..NN {
+            if b - a <= NN / 2 {
+                e.push((b, a));
+            } else {
+                e.push((a, b));
+            }
+        }
+    }
+    if SELF_LOOPS {
+        for i in 0..NN {
+            e.push((i, i));
+        }
+    }
+    e
+}
+fn check_graph() {
+    let mut has = vec![false; NN * NN]; 
+    for (d, s) in edges() {
+        if d != s {
+            assert!(!has[d * NN + s], "arête dupliquée");
+            has[d * NN + s] = true;
+        }
+    }
+    for a in 0..NN {
+        for b in a + 1..NN {
+            assert!(has[b * NN + a] ^ has[a * NN + b], "paire ({a},{b}) : tournoi violé");
+        }
+    }
+    for i in 0..NN {
+        assert!(has[((i + 1) % NN) * NN + i], "cycle hamiltonien rompu en {i}");
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct Lay {
+    pub ne: usize,
+    pub w: usize,  
+    pub u: usize,  
+    pub ub: usize, 
+    pub g: usize,  
+    pub gb: usize, 
+    pub c: usize,  
+    pub e: usize,  
+    pub e0: usize, 
+    pub wo: usize, 
+    pub vo: usize, 
+    pub bo: usize, 
+    pub total: usize,
+}
+impl Lay {
+    pub fn new(ne: usize) -> Lay {
+        let mut o = 0usize;
+        let mut take = |n: usize| -> usize {
+            let r = o;
+            o += n;
+            r
+        };
+        let w = take(ne * BB);
+        let u = take(ne * BB);
+        let ub = take(NU);
+        let g = take(NU * Z_DIM);
+        let gb = take(NU);
+        let c = take(NU);
+        let e = take(NU * Z_DIM);
+        let e0 = take(NU);
+        let wo = take(NOUT * NU);
+        let vo = take(NOUT * NU);
+        let bo = take(NOUT);
+        Lay { ne, w, u, ub, g, gb, c, e, e0, wo, vo, bo, total: o }
+    }
+    pub fn groups(&self) -> Vec<(&'static str, usize, usize)> {
+        let ne = self.ne;
+        vec![
+            ("W", self.w, ne * BB),
+            ("U", self.u, ne * BB),
+            ("u0", self.ub, NU),
+            ("G", self.g, NU * Z_DIM),
+            ("g0", self.gb, NU),
+            ("c", self.c, NU),
+            ("E", self.e, NU * Z_DIM),
+            ("e0", self.e0, NU),
+            ("Wo", self.wo, NOUT * NU),
+            ("Vo", self.vo, NOUT * NU),
+            ("bo", self.bo, NOUT),
+        ]
+    }
+}
+pub struct Work {
+    z: Vec<f64>,
+    q: Vec<f64>,
+    b: Vec<f64>,
+    s: Vec<f64>,  
+    p: Vec<f64>,  
+    dy: Vec<f64>, 
+    pub y: Vec<f64>, 
+    ds: Vec<f64>,
+    dc: Vec<f64>,
+    db: Vec<f64>,
+    da: Vec<f64>,
+    dp: Vec<f64>,
+    dq: Vec<f64>,
+}
+impl Work {
+    pub fn new() -> Work {
+        let v = |n: usize| vec![0.0f64; n];
+        Work {
+            z: v(Z_DIM), q: v(NU), b: v(NU), s: v(0), p: v(0), dy: v(0), y: v(0),
+            ds: v(NU), dc: v(NU), db: v(NU), da: v(NU), dp: v(NU), dq: v(NU),
+        }
+    }
+    fn reserve(&mut self, t: usize) {
+        let t = t.max(1);
+        if self.s.len() < t * NU {
+            self.s.resize(t * NU, 0.0);
+            self.p.resize(t * NU, 0.0);
+        }
+        if self.y.len() < t * NOUT {
+            self.y.resize(t * NOUT, 0.0);
+            self.dy.resize(t * NOUT, 0.0);
+        }
+    }
+}
+fn bs_mul_add(edges: &[(usize, usize)], blk: &[f64], x: &[f64], out: &mut [f64]) {
+    for (e, &(d, s)) in edges.iter().enumerate() {
+        let b = &blk[e * BB..(e + 1) * BB];
+        let xs = &x[s * ND..(s + 1) * ND];
+        let o = &mut out[d * ND..(d + 1) * ND];
+        for c in 0..ND {
+            let xc = xs[c];
+            let col = &b[c * ND..(c + 1) * ND];
+            for r in 0..ND {
+                o[r] += col[r] * xc;
+            }
+        }
+    }
+}
+fn bs_mul_t(edges: &[(usize, usize)], blk: &[f64], dd: &[f64], dx: &mut [f64]) {
+    for (e, &(d, s)) in edges.iter().enumerate() {
+        let b = &blk[e * BB..(e + 1) * BB];
+        let dv = &dd[d * ND..(d + 1) * ND];
+        let o = &mut dx[s * ND..(s + 1) * ND];
+        for c in 0..ND {
+            let col = &b[c * ND..(c + 1) * ND];
+            let mut acc = 0.0;
+            for r in 0..ND {
+                acc += col[r] * dv[r];
+            }
+            o[c] += acc;
+        }
+    }
+}
+fn bs_outer(edges: &[(usize, usize)], gblk: &mut [f64], dd: &[f64], x: &[f64]) {
+    for (e, &(d, s)) in edges.iter().enumerate() {
+        let gb = &mut gblk[e * BB..(e + 1) * BB];
+        let dv = &dd[d * ND..(d + 1) * ND];
+        let xs = &x[s * ND..(s + 1) * ND];
+        for c in 0..ND {
+            let xc = xs[c];
+            let col = &mut gb[c * ND..(c + 1) * ND];
+            for r in 0..ND {
+                col[r] += dv[r] * xc;
+            }
+        }
+    }
+}
+fn cm_mul_add(m: &[f64], x: &[f64], out: &mut [f64]) {
+    for c in 0..Z_DIM {
+        let xc = x[c];
+        if xc == 0.0 {
+            continue;
+        }
+        let col = &m[c * NU..(c + 1) * NU];
+        for r in 0..NU {
+            out[r] += col[r] * xc;
+        }
+    }
+}
+fn cm_outer(gm: &mut [f64], d: &[f64], x: &[f64]) {
+    for c in 0..Z_DIM {
+        let xc = x[c];
+        if xc == 0.0 {
+            continue;
+        }
+        let col = &mut gm[c * NU..(c + 1) * NU];
+        for r in 0..NU {
+            col[r] += d[r] * xc;
+        }
+    }
+}
+pub struct Net {
+    pub lay: Lay,
+    pub edges: Vec<(usize, usize)>,
+    pub p: Vec<f64>,
+}
+impl Net {
+    pub fn new(rng: &mut Rng) -> Net {
+        let ed = edges();
+        let lay = Lay::new(ed.len());
+        let mut indeg = [0usize; NN];
+        for &(d, _) in &ed {
+            indeg[d] += 1;
+        }
+        let mut p = vec![0.0f64; lay.total];
+        for (e, &(d, _)) in ed.iter().enumerate() {
+            let sd = 1.0 / ((ND * indeg[d]) as f64).sqrt();
+            for i in 0..BB {
+                p[lay.w + e * BB + i] = sd * rng.normal() as f64;
+                p[lay.u + e * BB + i] = sd * rng.normal() as f64;
+            }
+        }
+        for i in 0..NU * Z_DIM {
+            p[lay.g + i] = 0.15 * rng.normal() as f64;
+            p[lay.e + i] = 0.15 * rng.normal() as f64;
+        }
+        for i in 0..NOUT * NU {
+            p[lay.wo + i] = 0.03 * rng.normal() as f64;
+            p[lay.vo + i] = 0.03 * rng.normal() as f64;
+        }
+        Net { lay, edges: ed, p }
+    }
+    pub fn forward(&self, z32: &[f32], t: usize, ws: &mut Work) {
+        let l = &self.lay;
+        let ne = l.ne;
+        ws.reserve(t);
+        for i in 0..Z_DIM {
+            ws.z[i] = z32[i] as f64;
+        }
+        ws.q.copy_from_slice(&self.p[l.gb..l.gb + NU]);
+        cm_mul_add(&self.p[l.g..l.g + NU * Z_DIM], &ws.z, &mut ws.q);
+        {
+            let s0 = &mut ws.s[0..NU];
+            s0.copy_from_slice(&self.p[l.e0..l.e0 + NU]);
+            cm_mul_add(&self.p[l.e..l.e + NU * Z_DIM], &ws.z, s0);
+            for x in s0.iter_mut() {
+                *x = x.tanh();
+            }
+        }
+        let wblk = &self.p[l.w..l.w + ne * BB];
+        let ublk = &self.p[l.u..l.u + ne * BB];
+        for k in 0..t {
+            let (sa, sb) = ws.s.split_at_mut((k + 1) * NU);
+            let sk = &sa[k * NU..];
+            let pk = &mut ws.p[k * NU..(k + 1) * NU];
+            pk.copy_from_slice(&self.p[l.ub..l.ub + NU]);
+            bs_mul_add(&self.edges, ublk, sk, pk);
+            for a in 0..NU {
+                ws.b[a] = pk[a] * ws.q[a];
+            }
+            let yk = &mut ws.y[k * NOUT..(k + 1) * NOUT];
+            for o in 0..NOUT {
+                let wr = &self.p[l.wo + o * NU..l.wo + (o + 1) * NU];
+                let vr = &self.p[l.vo + o * NU..l.vo + (o + 1) * NU];
+                let mut acc = self.p[l.bo + o];
+                for a in 0..NU {
+                    acc += wr[a] * sk[a] + vr[a] * ws.b[a];
+                }
+                yk[o] = acc;
+            }
+            if k + 1 < t {
+                let sn = &mut sb[0..NU];
+                sn.copy_from_slice(&self.p[l.c..l.c + NU]);
+                for a in 0..NU {
+                    sn[a] += ws.b[a];
+                }
+                bs_mul_add(&self.edges, wblk, sk, sn);
+                for x in sn.iter_mut() {
+                    *x = x.tanh();
+                }
+            }
+        }
+    }
+    pub fn backward(&self, t: usize, ws: &mut Work, g: &mut [f64]) {
+        let l = &self.lay;
+        let ne = l.ne;
+        let wblk = &self.p[l.w..l.w + ne * BB];
+        let ublk = &self.p[l.u..l.u + ne * BB];
+        for x in ws.ds.iter_mut() {
+            *x = 0.0;
+        }
+        for x in ws.dq.iter_mut() {
+            *x = 0.0;
+        }
+        for k in (0..t).rev() {
+            let sk = &ws.s[k * NU..(k + 1) * NU];
+            let pk = &ws.p[k * NU..(k + 1) * NU];
+            for x in ws.dc.iter_mut() {
+                *x = 0.0;
+            }
+            for x in ws.db.iter_mut() {
+                *x = 0.0;
+            }
+            let dyk = &ws.dy[k * NOUT..(k + 1) * NOUT];
+            for o in 0..NOUT {
+                let d = dyk[o];
+                if d == 0.0 {
+                    continue;
+                }
+                g[l.bo + o] += d;
+                let wr = &self.p[l.wo + o * NU..l.wo + (o + 1) * NU];
+                let vr = &self.p[l.vo + o * NU..l.vo + (o + 1) * NU];
+                for a in 0..NU {
+                    let ba = pk[a] * ws.q[a];
+                    g[l.wo + o * NU + a] += d * sk[a];
+                    g[l.vo + o * NU + a] += d * ba;
+                    ws.dc[a] += d * wr[a];
+                    ws.db[a] += d * vr[a];
+                }
+            }
+            if k + 1 < t {
+                let sn = &ws.s[(k + 1) * NU..(k + 2) * NU];
+                for a in 0..NU {
+                    let da = ws.ds[a] * (1.0 - sn[a] * sn[a]);
+                    ws.da[a] = da;
+                    g[l.c + a] += da;
+                    ws.db[a] += da;
+                }
+                bs_outer(&self.edges, &mut g[l.w..l.w + ne * BB], &ws.da, sk);
+                bs_mul_t(&self.edges, wblk, &ws.da, &mut ws.dc);
+            }
+            for a in 0..NU {
+                let db = ws.db[a];
+                let dp = db * ws.q[a];
+                ws.dp[a] = dp;
+                ws.dq[a] += db * pk[a];
+                g[l.ub + a] += dp;
+            }
+            bs_outer(&self.edges, &mut g[l.u..l.u + ne * BB], &ws.dp, sk);
+            bs_mul_t(&self.edges, ublk, &ws.dp, &mut ws.dc);
+            std::mem::swap(&mut ws.ds, &mut ws.dc); 
+        }
+        let s0 = &ws.s[0..NU];
+        for a in 0..NU {
+            let da = ws.ds[a] * (1.0 - s0[a] * s0[a]);
+            ws.da[a] = da;
+            g[l.e0 + a] += da;
+        }
+        cm_outer(&mut g[l.e..l.e + NU * Z_DIM], &ws.da, &ws.z);
+        for a in 0..NU {
+            g[l.gb + a] += ws.dq[a];
+        }
+        cm_outer(&mut g[l.g..l.g + NU * Z_DIM], &ws.dq, &ws.z);
+    }
+    pub fn run_sample(&self, s: &Sample, w_trace: f64, ws: &mut Work, g: Option<&mut [f64]>) -> Stat {
+        let mut z = [0f32; Z_DIM];
+        encode(&s.prog, &s.view, &mut z);
+        self.forward(&z, s.t, ws);
+        let st = loss_raw(s, w_trace, &ws.y, &mut ws.dy);
+        if let Some(g) = g {
+            self.backward(s.t, ws, g);
+        }
+        st
+    }
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        let mut buf = Vec::with_capacity(12 + self.p.len() * 8);
+        buf.extend_from_slice(b"M0D1");
+        buf.extend_from_slice(&(self.p.len() as u64).to_le_bytes());
+        for x in &self.p {
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        std::fs::write(path, buf)
+    }
+    pub fn load(path: &str) -> std::io::Result<Net> {
+        let buf = std::fs::read(path)?;
+        let mut net = Net::new(&mut Rng::new(0));
+        if buf.len() != 12 + net.p.len() * 8 || buf[..4] != b"M0D1"[..] {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "fichier modèle invalide"));
+        }
+        for (i, c) in buf[12..].chunks_exact(8).enumerate() {
+            net.p[i] = f64::from_le_bytes(c.try_into().unwrap());
+        }
+        Ok(net)
+    }
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stat {
+    pub t: usize,
+    pub loss: f64,      
+    pub bits_ce: f64,   
+    pub trace_ce: f64,  
+    pub n_flag: usize,  
+    pub flag_ok: usize, 
+    pub trace_ok: usize,
+    pub regen: bool,     
+    pub trace_all: bool, 
+}
+fn softplus(x: f64) -> f64 {
+    if x > 0.0 { x + (-x).exp().ln_1p() } else { x.exp().ln_1p() }
+}
+fn sigmoid(x: f64) -> f64 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
+}
+pub fn decode(y: &[f64]) -> (u8, usize) {
+    let mut b = 0u8;
+    for i in 0..NB {
+        if y[i] > 0.0 {
+            b |= 1 << i;
+        }
+    }
+    let mut r = 0usize;
+    for j in 1..K_MAX {
+        if y[NB + j] > y[NB + r] {
+            r = j;
+        }
+    }
+    (b, r)
+}
+pub fn loss_raw(s: &Sample, w_trace: f64, ys: &[f64], dys: &mut [f64]) -> Stat {
+    let t = s.t;
+    let inv_t = 1.0 / t as f64;
+    let mut st = Stat { t, regen: true, trace_all: true, ..Stat::default() };
+    let (mut lb, mut lt) = (0.0f64, 0.0f64);
+    for k in 0..t {
+        let y = &ys[k * NOUT..(k + 1) * NOUT];
+        let dy = &mut dys[k * NOUT..(k + 1) * NOUT];
+        for d in dy.iter_mut() {
+            *d = 0.0;
+        }
+        if s.flag[k] {
+            let byte = s.emit[k];
+            let mut l = 0.0;
+            for i in 0..NB {
+                let tg = ((byte >> i) & 1) as f64;
+                l += softplus(y[i]) - tg * y[i];
+                dy[i] = (sigmoid(y[i]) - tg) * inv_t / NB as f64;
+            }
+            lb += l / NB as f64;
+            st.n_flag += 1;
+            if decode(y).0 == byte {
+                st.flag_ok += 1;
+            } else {
+                st.regen = false;
+            }
+        }
+        let tg = s.trace[k] as usize;
+        let lo = &y[NB..];
+        let mx = lo.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let sum: f64 = lo.iter().map(|v| (v - mx).exp()).sum();
+        lt += mx + sum.ln() - lo[tg];
+        for j in 0..K_MAX {
+            let pj = (lo[j] - mx).exp() / sum;
+            dy[NB + j] = w_trace * (pj - if j == tg { 1.0 } else { 0.0 }) * inv_t;
+        }
+        if decode(y).1 == tg {
+            st.trace_ok += 1;
+        } else {
+            st.trace_all = false;
+        }
+    }
+    st.bits_ce = lb / st.n_flag.max(1) as f64;
+    st.trace_ce = lt * inv_t;
+    st.loss = (lb + w_trace * lt) * inv_t;
+    st
+}
+pub struct Adam {
+    m: Vec<f64>,
+    v: Vec<f64>,
+    t: i32,
+    b1: f64,
+    b2: f64,
+    eps: f64,
+}
+impl Adam {
+    pub fn new(n: usize) -> Adam {
+        Adam { m: vec![0.0; n], v: vec![0.0; n], t: 0, b1: 0.9, b2: 0.999, eps: 1e-8 }
+    }
+    pub fn step(&mut self, p: &mut [f64], g: &[f64], lr: f64, clip: f64) -> f64 {
+        let gn = g.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if !gn.is_finite() {
+            return gn;
+        }
+        let sc = if clip > 0.0 && gn > clip { clip / gn } else { 1.0 };
+        self.t += 1;
+        let c1 = 1.0 - self.b1.powi(self.t);
+        let c2 = 1.0 - self.b2.powi(self.t);
+        for i in 0..p.len() {
+            let gi = g[i] * sc;
+            self.m[i] = self.b1 * self.m[i] + (1.0 - self.b1) * gi;
+            self.v[i] = self.b2 * self.v[i] + (1.0 - self.b2) * gi * gi;
+            p[i] -= lr * (self.m[i] / c1) / ((self.v[i] / c2).sqrt() + self.eps);
+        }
+        gn
+    }
+}
+pub fn gradcheck(seed: u64) -> bool {
+    check_graph();
+    println!("graphe : tournoi sur {} nœuds, une arête par paire, cycle hamiltonien : ok", NN);
+    let pr = Prior::demo();
+    let mut rng = Rng::new(seed);
+    let mut net = Net::new(&mut rng);
+    let lay = net.lay;
+    assert_eq!(lay.groups().iter().map(|g| g.2).sum::<usize>(), lay.total);
+    println!("D : {} paramètres, {} arêtes, {} unités", net.p.len(), net.edges.len(), NU);
+    for &(off, len) in &[(lay.ub, NU), (lay.gb, NU), (lay.c, NU), (lay.e0, NU), (lay.bo, NOUT)] {
+        for i in 0..len {
+            net.p[off + i] = 0.1 * rng.normal() as f64;
+        }
+    }
+    let samples: Vec<Sample> = (0..6).map(|_| sample_world(&mut rng, &pr, 100_000).expect("monde")).collect();
+    let mut ws = Work::new();
+    let mut z = [0f32; Z_DIM];
+    encode(&samples[0].prog, &samples[0].view, &mut z);
+    net.forward(&z, 16, &mut ws);
+    let long: Vec<f64> = ws.y[..8 * NOUT].to_vec();
+    net.forward(&z, 8, &mut ws);
+    let causal = ws.y[..8 * NOUT] == long[..];
+    println!("causalité (y_k indépendant de l'horizon) : {}", if causal { "ok" } else { "ÉCHEC" });
+    let total = |n: &Net, w: &mut Work| -> f64 {
+        samples.iter().map(|s| n.run_sample(s, 1.0, w, None).loss).sum::<f64>()
+    };
+    let mut ga = vec![0.0f64; net.p.len()];
+    for s in &samples {
+        net.run_sample(s, 1.0, &mut ws, Some(&mut ga[..]));
+    }
+    let eps = 1e-5;
+    let mut ok = causal;
+    println!("{:<4} {:>10} {:>10} {:>10}", "grp", "|g| max", "err abs", "err rel*");
+    for (name, off, len) in lay.groups() {
+        let mut idx: Vec<usize> = (0..len).collect();
+        idx.sort_by(|&a, &b| ga[off + b].abs().total_cmp(&ga[off + a].abs()));
+        let gmax = ga[off + idx[0]].abs();
+        let mut probes: Vec<usize> = idx[..8].to_vec(); 
+        for _ in 0..8 {
+            probes.push(rng.below(len)); 
+        }
+        let (mut eabs, mut erel) = (0.0f64, 0.0f64);
+        for (n, &i) in probes.iter().enumerate() {
+            let j = off + i;
+            let x0 = net.p[j];
+            net.p[j] = x0 + eps;
+            let lp = total(&net, &mut ws);
+            net.p[j] = x0 - eps;
+            let lm = total(&net, &mut ws);
+            net.p[j] = x0;
+            let gn = (lp - lm) / (2.0 * eps);
+            let d = (ga[j] - gn).abs();
+            eabs = eabs.max(d);
+            if n < 8 {
+                erel = erel.max(d / ga[j].abs().max(gn.abs()));
+            }
+        }
+        let good = gmax > 0.0 && erel < 1e-4 && eabs < 1e-6;
+        ok &= good;
+        println!("{:<4} {:>10.3e} {:>10.2e} {:>10.2e}  {}", name, gmax, eabs, erel, if good { "ok" } else { "ÉCHEC" });
+    }
+    println!("(* erreur relative sur les 8 plus grands gradients du groupe ; seuils : rel < 1e-4, abs < 1e-6)");
+    println!("{}", if ok { "GRADCHECK OK" } else { "GRADCHECK ÉCHEC" });
+    ok
+}
+pub fn overfit(seed: u64) {
+    let pr = Prior::demo();
+    let mut rng = Rng::new(seed);
+    let mut net = Net::new(&mut rng);
+    println!(
+        "D : {} paramètres, {} arêtes ({} paires + {} diagonales), {} unités",
+        net.p.len(), net.edges.len(), NN * (NN - 1) / 2, net.edges.len() - NN * (NN - 1) / 2, NU
+    );
+    let set: Vec<Sample> = (0..16).map(|_| sample_world(&mut rng, &pr, 100_000).expect("monde")).collect();
+    let n = set.len();
+    let mut ws = Work::new();
+    let mut g = vec![0.0f64; net.p.len()];
+    let mut adam = Adam::new(net.p.len());
+    let steps: usize = 600;
+    let t0 = Instant::now();
+    for it in 0..=steps {
+        for x in g.iter_mut() {
+            *x = 0.0;
+        }
+        let mut loss = 0.0f64;
+        let (mut fok, mut nf, mut tok, mut nt, mut rg, mut ta) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        for s in &set {
+            let st = net.run_sample(s, 1.0, &mut ws, Some(&mut g[..]));
+            loss += st.loss;
+            fok += st.flag_ok;
+            nf += st.n_flag;
+            tok += st.trace_ok;
+            nt += st.t;
+            rg += st.regen as usize;
+            ta += st.trace_all as usize;
+        }
+        let inv = 1.0 / n as f64;
+        for x in g.iter_mut() {
+            *x *= inv;
+        }
+        let gn = adam.step(&mut net.p, &g, 2e-3, 1.0);
+        if it % 50 == 0 {
+            println!(
+                "{:>4}  L={:.4}  octets {}/{}  règles {}/{}  régén. exacte {}/{}  trace exacte {}/{}  |g|={:.3}",
+                it, loss * inv, fok, nf, tok, nt, rg, n, ta, n, gn
+            );
+        }
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    println!("{:.0} échantillons/s (forward+backward, 1 fil)", ((steps + 1) * n) as f64 / dt);
+}
+
+
+
+========================================
+File: ./src/oneshot.rs
+========================================
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll, Waker};
+struct State<T> {
+    value: Option<T>,
+    waker: Option<Waker>,
+    tx_dropped: bool,
+    rx_dropped: bool,
+}
+struct Inner<T> {
+    state: Mutex<State<T>>,
+    ready: Condvar,
+}
+fn lock<T>(m: &Mutex<State<T>>) -> MutexGuard<'_, State<T>> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+pub(crate) struct Sender<T> {
+    inner: Arc<Inner<T>>,
+}
+pub(crate) struct Receiver<T> {
+    inner: Arc<Inner<T>>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Canceled;
+pub(crate) fn channel<T>() -> (Sender<T>, Receiver<T>) {
+    let inner = Arc::new(Inner {
+        state: Mutex::new(State { value: None, waker: None, tx_dropped: false, rx_dropped: false }),
+        ready: Condvar::new(),
+    });
+    (Sender { inner: inner.clone() }, Receiver { inner })
+}
+impl<T> Sender<T> {
+    pub(crate) fn send(self, value: T) -> Result<(), T> {
+        let mut st = lock(&self.inner.state);
+        if st.rx_dropped {
+            return Err(value);
+        }
+        st.value = Some(value);
+        Ok(())
+    }
+}
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        let waker = {
+            let mut st = lock(&self.inner.state);
+            st.tx_dropped = true;
+            st.waker.take()
+        };
+        self.inner.ready.notify_all();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+impl<T> Receiver<T> {
+    pub(crate) fn wait(self) -> Result<T, Canceled> {
+        let mut st = lock(&self.inner.state);
+        loop {
+            if let Some(value) = st.value.take() {
+                return Ok(value);
+            }
+            if st.tx_dropped {
+                return Err(Canceled);
+            }
+            st = self.inner.ready.wait(st).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+impl<T> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        lock(&self.inner.state).rx_dropped = true;
+    }
+}
+impl<T> Future for Receiver<T> {
+    type Output = Result<T, Canceled>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut st = lock(&self.inner.state);
+        if let Some(value) = st.value.take() {
+            return Poll::Ready(Ok(value));
+        }
+        if st.tx_dropped {
+            return Poll::Ready(Err(Canceled));
+        }
+        if !st.waker.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+            st.waker = Some(cx.waker().clone());
+        }
+        Poll::Pending
+    }
+}
+
+
+
+========================================
+File: ./src/rng.rs
+========================================
+#[derive(Clone)]
+pub struct Rng {
+    s: [u64; 4],
+}
+fn splitmix64(x: &mut u64) -> u64 {
+    *x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+impl Rng {
+    pub fn new(seed: u64) -> Rng {
+        let mut x = seed;
+        let s = [
+            splitmix64(&mut x),
+            splitmix64(&mut x),
+            splitmix64(&mut x),
+            splitmix64(&mut x),
+        ];
+        Rng { s }
+    }
+    pub fn next_u64(&mut self) -> u64 {
+        let r = self.s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+        let t = self.s[1] << 17;
+        self.s[2] ^= self.s[0];
+        self.s[3] ^= self.s[1];
+        self.s[1] ^= self.s[2];
+        self.s[0] ^= self.s[3];
+        self.s[2] ^= t;
+        self.s[3] = self.s[3].rotate_left(45);
+        r
+    }
+    pub fn f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
+    pub fn below(&mut self, n: usize) -> usize {
+        (((self.next_u64() >> 32) * (n as u64)) >> 32) as usize
+    }
+    pub fn range(&mut self, lo: usize, hi: usize) -> usize {
+        lo + self.below(hi - lo + 1)
+    }
+    pub fn bernoulli(&mut self, p: f64) -> bool {
+        self.f64() < p
+    }
+    pub fn normal(&mut self) -> f32 {
+        let u1 = self.f64().max(1e-12);
+        let u2 = self.f64();
+        ((-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()) as f32
+    }
+    pub fn categorical(&mut self, w: &[f64]) -> usize {
+        let tot: f64 = w.iter().sum();
+        let mut x = self.f64() * tot;
+        for (i, &wi) in w.iter().enumerate() {
+            if x < wi {
+                return i;
+            }
+            x -= wi;
+        }
+        let mut last = 0;
+        for (i, &wi) in w.iter().enumerate() {
+            if wi > 0.0 {
+                last = i;
+            }
+        }
+        last
+    }
+    pub fn fork(&mut self) -> Rng {
+        Rng::new(self.next_u64())
+    }
+}
+
+
+
+========================================
+File: ./src/runtime.rs
+========================================
+use std::cell::{Cell, RefCell};
+use std::future::Future;
+use std::io;
+use std::mem;
+use std::os::fd::AsRawFd;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread::{self, JoinHandle, Thread};
+use crate::engine::{Engine, Options, StateMachine};
+use crate::error::{Error, Result};
+use crate::journal::Recovery;
+use crate::oneshot::{self, Sender};
+use crate::sys::{Epoll, EventFd, EPOLLIN};
+const WAKE: u64 = 0;
+type LocalFuture = Pin<Box<dyn Future<Output = ()>>>;
+type Deferred = Box<dyn FnOnce(Option<&Error>)>;
+struct Queue<S: StateMachine> {
+    jobs: Vec<Box<dyn FnOnce(&Ctx<S>) + Send>>,
+    woken: Vec<usize>,
+    closed: bool,
+}
+impl<S: StateMachine> Queue<S> {
+    fn new(closed: bool) -> Self {
+        Queue { jobs: Vec::new(), woken: Vec::new(), closed }
+    }
+}
+struct Shared<S: StateMachine> {
+    queue: Mutex<Queue<S>>,
+    wake: EventFd,
+    syncs: AtomicU64,
+    durable: AtomicU64,
+    snapshot_errors: AtomicU64,
+}
+fn lock<S: StateMachine>(queue: &Mutex<Queue<S>>) -> MutexGuard<'_, Queue<S>> {
+    queue.lock().unwrap_or_else(PoisonError::into_inner)
+}
+impl<S: StateMachine> Shared<S> {
+    fn new() -> io::Result<Self> {
+        Ok(Shared {
+            queue: Mutex::new(Queue::new(false)),
+            wake: EventFd::new()?,
+            syncs: AtomicU64::new(0),
+            durable: AtomicU64::new(0),
+            snapshot_errors: AtomicU64::new(0),
+        })
+    }
+    fn post<F>(&self, job: F) -> bool
+    where
+        F: FnOnce(&Ctx<S>) + Send + 'static,
+    {
+        let rejected = {
+            let mut queue = lock(&self.queue);
+            if queue.closed {
+                Some(job)
+            } else {
+                queue.jobs.push(Box::new(job));
+                None
+            }
+        };
+        if rejected.is_some() {
+            return false;
+        }
+        self.wake.notify();
+        true
+    }
+    fn take(&self) -> Queue<S> {
+        let mut queue = lock(&self.queue);
+        let closed = queue.closed;
+        mem::replace(&mut *queue, Queue::new(closed))
+    }
+    fn request_close(&self) {
+        lock(&self.queue).closed = true;
+        self.wake.notify();
+    }
+    fn close(&self) -> Queue<S> {
+        let mut queue = lock(&self.queue);
+        mem::replace(&mut *queue, Queue::new(true))
+    }
+}
+struct TaskWaker<S: StateMachine> {
+    id: usize,
+    queued: AtomicBool,
+    shared: Arc<Shared<S>>,
+}
+impl<S: StateMachine + 'static> Wake for TaskWaker<S> {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        if !self.queued.swap(true, Ordering::AcqRel) {
+            lock(&self.shared.queue).woken.push(self.id);
+            self.shared.wake.notify();
+        }
+    }
+}
+struct CloseOnExit<S: StateMachine>(Arc<Shared<S>>);
+impl<S: StateMachine> Drop for CloseOnExit<S> {
+    fn drop(&mut self) {
+        drop(self.0.close());
+    }
+}
+struct Core<S: StateMachine> {
+    engine: RefCell<Engine<S>>,
+    shared: Arc<Shared<S>>,
+    durable: Cell<u64>,
+    waiters: RefCell<Vec<Waker>>,
+    deferred: RefCell<Vec<Deferred>>,
+    spawned: RefCell<Vec<LocalFuture>>,
+}
+impl<S: StateMachine> Core<S> {
+    fn commit_batch(&self) -> Result<()> {
+        let last = self.engine.borrow().last_seq();
+        let mut outcome: Result<()> = Ok(());
+        if last > self.durable.get() {
+            outcome = self.engine.borrow_mut().sync();
+            if outcome.is_ok() {
+                self.durable.set(last);
+                self.shared.durable.store(last, Ordering::Release);
+                self.shared.syncs.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let deferred = mem::take(&mut *self.deferred.borrow_mut());
+        let failure = outcome.as_ref().err();
+        for done in deferred {
+            done(failure);
+        }
+        if outcome.is_ok() {
+            let waiters = mem::take(&mut *self.waiters.borrow_mut());
+            for waker in waiters {
+                waker.wake();
+            }
+        }
+        outcome
+    }
+    fn snapshot_if_due(&self, retry_after: &mut u64, backoff: u64) {
+        let mut engine = self.engine.borrow_mut();
+        let last = engine.last_seq();
+        if last >= *retry_after && engine.maybe_snapshot().is_err() {
+            self.shared.snapshot_errors.fetch_add(1, Ordering::Relaxed);
+            *retry_after = last + backoff;
+        }
+    }
+}
+pub struct Ctx<S: StateMachine> {
+    core: Rc<Core<S>>,
+}
+impl<S: StateMachine> Clone for Ctx<S> {
+    fn clone(&self) -> Self {
+        Ctx { core: self.core.clone() }
+    }
+}
+impl<S: StateMachine + 'static> Ctx<S> {
+    pub async fn submit(&self, event: &S::Event) -> Result<u64> {
+        let seq = self.core.engine.borrow_mut().submit(event)?;
+        Durable { core: self.core.clone(), seq }.await
+    }
+    pub fn read<R>(&self, f: impl FnOnce(&S) -> R) -> R {
+        f(self.core.engine.borrow().state())
+    }
+    pub fn spawn(&self, task: impl Future<Output = ()> + 'static) {
+        self.core.spawned.borrow_mut().push(Box::pin(task));
+    }
+    pub fn handle(&self) -> Handle<S> {
+        Handle { shared: self.core.shared.clone() }
+    }
+    fn defer(&self, f: impl FnOnce(Option<&Error>) + 'static) {
+        self.core.deferred.borrow_mut().push(Box::new(f));
+    }
+}
+struct Durable<S: StateMachine> {
+    core: Rc<Core<S>>,
+    seq: u64,
+}
+impl<S: StateMachine> Future for Durable<S> {
+    type Output = Result<u64>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<u64>> {
+        if self.core.durable.get() >= self.seq {
+            Poll::Ready(Ok(self.seq))
+        } else {
+            self.core.waiters.borrow_mut().push(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+struct Task<S: StateMachine> {
+    fut: LocalFuture,
+    flag: Arc<TaskWaker<S>>,
+    waker: Waker,
+}
+struct Executor<S: StateMachine> {
+    slots: Vec<Option<Task<S>>>,
+    free: Vec<usize>,
+}
+impl<S: StateMachine + 'static> Executor<S> {
+    fn new() -> Self {
+        Executor { slots: Vec::new(), free: Vec::new() }
+    }
+    fn admit(&mut self, ctx: &Ctx<S>) {
+        let incoming = mem::take(&mut *ctx.core.spawned.borrow_mut());
+        for fut in incoming {
+            let id = self.free.pop().unwrap_or(self.slots.len());
+            let flag = Arc::new(TaskWaker {
+                id,
+                queued: AtomicBool::new(false),
+                shared: ctx.core.shared.clone(),
+            });
+            let waker = Waker::from(flag.clone());
+            waker.wake_by_ref();
+            let task = Some(Task { fut, flag, waker });
+            if id == self.slots.len() {
+                self.slots.push(task);
+            } else {
+                self.slots[id] = task;
+            }
+        }
+    }
+    fn poll_task(&mut self, id: usize) {
+        let Some(Some(task)) = self.slots.get_mut(id) else { return };
+        task.flag.queued.store(false, Ordering::Release);
+        let mut cx = Context::from_waker(&task.waker);
+        if task.fut.as_mut().poll(&mut cx).is_ready() {
+            self.slots[id] = None;
+            self.free.push(id);
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stats {
+    pub syncs: u64,
+    pub durable_seq: u64,
+    pub snapshot_errors: u64,
+}
+pub struct Handle<S: StateMachine> {
+    shared: Arc<Shared<S>>,
+}
+impl<S: StateMachine> Clone for Handle<S> {
+    fn clone(&self) -> Self {
+        Handle { shared: self.shared.clone() }
+    }
+}
+impl<S: StateMachine + 'static> Handle<S> {
+    pub fn submit(&self, event: &S::Event) -> Pending<u64> {
+        let bytes = match postcard::to_allocvec(event) {
+            Ok(bytes) => bytes,
+            Err(e) => return Pending::failed(e.into()),
+        };
+        self.call(move |ctx, tx| {
+            let applied = ctx.core.engine.borrow_mut().submit_encoded(&bytes);
+            match applied {
+                Ok(seq) => ctx.defer(reply_when_durable(tx, seq)),
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            }
+        })
+    }
+    pub fn read<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&S) -> R + Send + 'static,
+    ) -> Pending<R> {
+        self.call(move |ctx, tx| {
+            let value = f(ctx.core.engine.borrow().state());
+            ctx.defer(reply_when_durable(tx, value));
+        })
+    }
+    pub fn read_at<R: Send + 'static>(
+        &self,
+        seq: u64,
+        f: impl FnOnce(&S) -> R + Send + 'static,
+    ) -> Pending<R> {
+        self.call(move |ctx, tx| {
+            let replayed = ctx.core.engine.borrow().state_at(seq);
+            match replayed {
+                Ok(state) => ctx.defer(reply_when_durable(tx, f(&state))),
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            }
+        })
+    }
+    pub fn spawn<F, Fut>(&self, make: F) -> Result<()>
+    where
+        F: FnOnce(Ctx<S>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        let posted = self.shared.post(move |ctx: &Ctx<S>| ctx.spawn(make(ctx.clone())));
+        if posted {
+            Ok(())
+        } else {
+            Err(Error::Closed)
+        }
+    }
+    pub fn stats(&self) -> Stats {
+        Stats {
+            syncs: self.shared.syncs.load(Ordering::Relaxed),
+            durable_seq: self.shared.durable.load(Ordering::Acquire),
+            snapshot_errors: self.shared.snapshot_errors.load(Ordering::Relaxed),
+        }
+    }
+    fn call<T: Send + 'static>(
+        &self,
+        job: impl FnOnce(&Ctx<S>, Sender<Result<T>>) + Send + 'static,
+    ) -> Pending<T> {
+        let (tx, rx) = oneshot::channel();
+        self.shared.post(move |ctx: &Ctx<S>| job(ctx, tx));
+        Pending { rx }
+    }
+}
+fn reply_when_durable<T: 'static>(
+    tx: Sender<Result<T>>,
+    value: T,
+) -> impl FnOnce(Option<&Error>) + 'static {
+    move |failure: Option<&Error>| {
+        let _ = tx.send(match failure {
+            None => Ok(value),
+            Some(e) => Err(replicate(e)),
+        });
+    }
+}
+fn replicate(e: &Error) -> Error {
+    match e {
+        Error::Io(e) => Error::Io(io::Error::new(e.kind(), e.to_string())),
+        other => Error::Io(io::Error::new(io::ErrorKind::Other, other.to_string())),
+    }
+}
+#[must_use = "la commande part même si la réponse est ignorée, mais son échec le serait aussi"]
+pub struct Pending<T> {
+    rx: oneshot::Receiver<Result<T>>,
+}
+impl<T> Pending<T> {
+    fn failed(e: Error) -> Self {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Err(e));
+        Pending { rx }
+    }
+    pub fn wait(self) -> Result<T> {
+        self.rx.wait().unwrap_or(Err(Error::Closed))
+    }
+}
+impl<T> Future for Pending<T> {
+    type Output = Result<T>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<T>> {
+        match Pin::new(&mut self.rx).poll(cx) {
+            Poll::Ready(reply) => Poll::Ready(reply.unwrap_or(Err(Error::Closed))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+struct ThreadWaker(Thread);
+impl Wake for ThreadWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+pub fn block_on<F: Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+            return out;
+        }
+        thread::park();
+    }
+}
+pub struct Server<S: StateMachine> {
+    handle: Handle<S>,
+    thread: Option<JoinHandle<Result<()>>>,
+}
+impl<S: StateMachine + 'static> Server<S> {
+    pub fn start(path: impl Into<PathBuf>, opts: Options) -> Result<(Self, Recovery)> {
+        let path = path.into();
+        let shared = Arc::new(Shared::<S>::new()?);
+        let epoll = Epoll::new()?;
+        epoll.add(shared.wake.as_raw_fd(), WAKE, EPOLLIN)?;
+        let (ready, started) = oneshot::channel::<Result<Recovery>>();
+        let thread = {
+            let shared = shared.clone();
+            thread::Builder::new()
+                .name("chronicle-loop".into())
+                .spawn(move || run::<S>(path, opts, shared, epoll, ready))?
+        };
+        match started.wait() {
+            Ok(Ok(recovery)) => {
+                Ok((Server { handle: Handle { shared }, thread: Some(thread) }, recovery))
+            }
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(e)
+            }
+            Err(_) => match thread.join() {
+                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(Err(e)) => Err(e),
+                Ok(Ok(())) => Err(Error::Closed),
+            },
+        }
+    }
+    pub fn handle(&self) -> Handle<S> {
+        self.handle.clone()
+    }
+    pub fn shutdown(mut self) -> Result<()> {
+        self.stop()
+    }
+    fn stop(&mut self) -> Result<()> {
+        let Some(thread) = self.thread.take() else { return Ok(()) };
+        self.handle.shared.request_close();
+        match thread.join() {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+}
+impl<S: StateMachine> Drop for Server<S> {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            self.handle.shared.request_close();
+            let _ = thread.join(); 
+        }
+    }
+}
+fn run<S: StateMachine + 'static>(
+    path: PathBuf,
+    opts: Options,
+    shared: Arc<Shared<S>>,
+    epoll: Epoll,
+    ready: Sender<Result<Recovery>>,
+) -> Result<()> {
+    let backoff = opts.snapshot_every.max(1);
+    let (engine, recovery) = match Engine::<S>::open_with(&path, opts) {
+        Ok(opened) => opened,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return Ok(());
+        }
+    };
+    let _closer = CloseOnExit(shared.clone());
+    let last = engine.last_seq();
+    shared.durable.store(last, Ordering::Release);
+    let ctx = Ctx {
+        core: Rc::new(Core {
+            engine: RefCell::new(engine),
+            shared: shared.clone(),
+            durable: Cell::new(last),
+            waiters: RefCell::new(Vec::new()),
+            deferred: RefCell::new(Vec::new()),
+            spawned: RefCell::new(Vec::new()),
+        }),
+    };
+    let _ = ready.send(Ok(recovery));
+    let mut tasks = Executor::<S>::new();
+    let mut tokens = Vec::new();
+    let mut retry_after = 0;
+    loop {
+        tokens.clear();
+        epoll.wait(&mut tokens, None)?;
+        shared.wake.drain();
+        let batch = shared.take();
+        for job in batch.jobs {
+            job(&ctx);
+        }
+        tasks.admit(&ctx);
+        for id in batch.woken {
+            tasks.poll_task(id);
+        }
+        tasks.admit(&ctx);
+        ctx.core.commit_batch()?;
+        ctx.core.snapshot_if_due(&mut retry_after, backoff);
+        if batch.closed {
+            let mut engine = ctx.core.engine.borrow_mut();
+            if engine.snapshots().last() != Some(&engine.last_seq()) {
+                let _ = engine.snapshot();
+            }
+            return Ok(());
+        }
+    }
+}
+
+
+
+========================================
+File: ./src/sizes.rs
+========================================
+#![allow(dead_code)]
+use crate::eval::{draw_world, nontrivial, Part};
+use crate::meta::{Prior, Program};
+use crate::tape::{decode, Net, Work, NOUT};
+use crate::rng::Rng;
+use std::collections::VecDeque;
+const NG: usize = 4;
+pub fn queue_lens(p: &Program, t: usize) -> Vec<usize> {
+    let mut q: VecDeque<u8> = p.q0.iter().copied().collect();
+    let mut out = Vec::with_capacity(t);
+    for _ in 0..t {
+        out.push(q.len());
+        let j = match q.pop_front() {
+            Some(j) => j as usize,
+            None => break,
+        };
+        for _ in 1..p.m {
+            let _ = q.pop_front();
+        }
+        for &x in &p.prod[j] {
+            q.push_back(x);
+        }
+    }
+    out
+}
+fn pc(a: usize, b: usize) -> f64 {
+    100.0 * a as f64 / b.max(1) as f64
+}
+pub fn run(net: &Net, pr: &Prior, q: usize, n: usize, seed: u64) {
+    let mut rng = Rng::new(seed ^ 0x517E);
+    let mut ws = Work::new();
+    let tm = pr.t_hi.max(1);
+    let (mut risk_s, mut err_s) = (vec![0usize; tm], vec![0usize; tm]);
+    let (mut rule_s, mut byte_s) = (0usize, 0usize);
+    let mut risk_d = vec![vec![0usize; tm]; NG];
+    let (mut rule_d, mut byte_d) = ([0usize; NG], [0usize; NG]);
+    let (mut nw, mut ok) = ([0usize; 2], [0usize; 2]);
+    let (mut before, mut after) = (0usize, 0usize);
+    let (mut got, mut guard) = (0usize, 0usize);
+    while got < n && guard < 400 * n.max(1) {
+        guard += 1;
+        let s = match draw_world(&mut rng, pr, Part::Held, 1_000_000) {
+            Some(s) if nontrivial(&s) => s,
+            _ => continue,
+        };
+        net.run_sample(&s, 1.0, &mut ws, None);
+        let ql = queue_lens(&s.prog, s.t);
+        let first_deep = ql.iter().position(|&x| x > q);
+        let deep = first_deep.is_some();
+        let mut err: Option<usize> = None;
+        for k in 0..s.t {
+            let (b, r) = decode(&ws.y[k * NOUT..(k + 1) * NOUT]);
+            let u = ql[k].min(s.prog.m * (s.t - k));
+            let g = if ql[k] <= q {
+                0
+            } else if u <= q {
+                1
+            } else if u <= q + q / 2 {
+                2
+            } else {
+                3
+            };
+            if deep {
+                risk_d[g][k] += 1;
+            } else {
+                risk_s[k] += 1;
+            }
+            let rule_bad = r != s.trace[k] as usize;
+            let byte_bad = !rule_bad && s.flag[k] && b != s.emit[k];
+            if rule_bad || byte_bad {
+                if deep {
+                    if rule_bad {
+                        rule_d[g] += 1;
+                    } else {
+                        byte_d[g] += 1;
+                    }
+                } else {
+                    err_s[k] += 1;
+                    if rule_bad {
+                        rule_s += 1;
+                    } else {
+                        byte_s += 1;
+                    }
+                }
+                err = Some(k);
+                break;
+            }
+        }
+        nw[deep as usize] += 1;
+        match (err, first_deep) {
+            (None, _) => ok[deep as usize] += 1,
+            (Some(e), Some(f)) => {
+                if e < f {
+                    before += 1;
+                } else {
+                    after += 1;
+                }
+            }
+            _ => {}
+        }
+        got += 1;
+    }
+    let mut hz = vec![0.0f64; tm];
+    for k in 0..tm {
+        hz[k] = if risk_s[k] >= 30 {
+            err_s[k] as f64 / risk_s[k] as f64
+        } else if k > 0 {
+            hz[k - 1]
+        } else {
+            0.0
+        };
+    }
+    println!(
+        "=== TAILLE DE FILE : D entraîné pour une file ≤ {} ; {} mondes non vus non triviaux, T ∈ [{}, {}], file jusqu'à {} ===",
+        q, got, pr.t_lo, pr.t_hi, pr.q_hi
+    );
+    println!(
+        "peu profonds (file ≤ {} à tous les ticks) : {} mondes, fid {:.1}%  |  profonds : {} mondes, fid {:.1}%",
+        q,
+        nw[0],
+        pc(ok[0], nw[0]),
+        nw[1],
+        pc(ok[1], nw[1])
+    );
+    println!("\n{:<26}{:>10}{:>8}{:>8}{:>11}{:>8}", "ticks", "à risque", "règle", "octet", "attendu*", "SMR");
+    println!(
+        "{:<26}{:>10}{:>8}{:>8}{:>11}{:>8}",
+        "référence (peu profonds)",
+        risk_s.iter().sum::<usize>(),
+        rule_s,
+        byte_s,
+        "—",
+        "1.00"
+    );
+    let names = [
+        format!("profonds, file ≤ {}", q),
+        format!("file > {}, utile ≤ {}", q, q),
+        format!("utile ∈ ]{}, {}]", q, q + q / 2),
+        format!("utile > {}", q + q / 2),
+    ];
+    let mut smr = [0.0f64; NG];
+    for g in 0..NG {
+        let risk: usize = risk_d[g].iter().sum();
+        let exp: f64 = (0..tm).map(|k| risk_d[g][k] as f64 * hz[k]).sum();
+        let obs = (rule_d[g] + byte_d[g]) as f64;
+        let cell = if exp >= 5.0 {
+            smr[g] = obs / exp;
+            format!("{:.2}", smr[g])
+        } else {
+            "n/a".to_string()
+        };
+        println!("{:<26}{:>10}{:>8}{:>8}{:>11.1}{:>8}", names[g], risk, rule_d[g], byte_d[g], exp, cell);
+    }
+    println!("* attendu = erreurs qu'auraient ces mêmes ticks avec le risque des mondes peu profonds au même indice de tick.");
+    println!("  SMR = observé / attendu (≥ 3 : excès net ; < 1,5 : nul ; n/a : attendu < 5).");
+    println!(
+        "mondes profonds ratés : {} avant le premier tick où la file dépasse {}, {} à partir de ce tick",
+        before, q, after
+    );
+    let verdict = if nw[1] < 100 {
+        "ÉCHANTILLON INSUFFISANT (moins de 100 mondes profonds) : augmenter --n ou --qhi"
+    } else if smr[0] >= 3.0 {
+        "CLASSE : D rate déjà les mondes profonds quand leur file est courte ; l'axe profondeur mesurait la classe de programme, pas la taille"
+    } else if smr[2] >= 3.0 || smr[3] >= 3.0 {
+        "TAILLE UTILE : l'excès apparaît quand D doit porter plus de symboles qu'à l'entraînement"
+    } else if smr[1] >= 3.0 {
+        "QUEUE NON LUE : D se dégrade dès que la file dépasse q, même si le surplus ne sera jamais lu"
+    } else {
+        "AUCUN EXCÈS NET : ni classe, ni taille utile, ni queue non lue n'expliquent l'effondrement ; regarder l'indice de tick et le type de production"
+    };
+    println!(
+        "règle (fixée avant mesure) : CLASSE si SMR[file ≤ q] ≥ 3 ; sinon TAILLE UTILE si un des deux SMR « utile > q » ≥ 3 ; sinon QUEUE NON LUE si SMR[file > q, utile ≤ q] ≥ 3 ; sinon AUCUN EXCÈS NET."
+    );
+    println!("verdict : {}", verdict);
+}
+
+
+
+========================================
+File: ./src/snapshot.rs
+========================================
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use crate::error::Result;
+use crate::journal::Journal;
+use crate::StateMachine;
+const MAGIC: [u8; 8] = *b"CHRNSNP\0";
+const FORMAT: u32 = 1;
+const HEADER: usize = 28;
+pub(crate) struct SnapshotStore {
+    dir: PathBuf,
+    seqs: Vec<u64>,
+}
+impl SnapshotStore {
+    pub(crate) fn open(dir: PathBuf) -> Result<Self> {
+        let mut seqs: Vec<u64> = Vec::new();
+        match fs::read_dir(&dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry?.path();
+                    match path.extension().and_then(|e| e.to_str()) {
+                        Some("tmp") => {
+                            let _ = fs::remove_file(&path);
+                        }
+                        Some("snap") => {
+                            let stem = path.file_stem().and_then(|s| s.to_str());
+                            if let Some(seq) = stem.and_then(|s| s.parse::<u64>().ok()) {
+                                seqs.push(seq);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        seqs.sort_unstable();
+        Ok(Self { dir, seqs })
+    }
+    pub(crate) fn seqs(&self) -> &[u64] {
+        &self.seqs
+    }
+    pub(crate) fn latest(&self) -> Option<u64> {
+        self.seqs.last().copied()
+    }
+    pub(crate) fn save<S: StateMachine>(&mut self, journal: &Journal, state: &S) -> Result<u64> {
+        let seq = journal.last_seq();
+        if seq == 0 {
+            return Ok(0);
+        }
+        let payload = postcard::to_allocvec(state)?;
+        let mut head = [0u8; HEADER];
+        head[0..8].copy_from_slice(&MAGIC);
+        head[8..12].copy_from_slice(&FORMAT.to_le_bytes());
+        head[12..16].copy_from_slice(&S::STATE_VERSION.to_le_bytes());
+        head[16..24].copy_from_slice(&seq.to_le_bytes());
+        head[24..28].copy_from_slice(&anchor_of(journal, seq).unwrap_or_default().to_le_bytes());
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&head);
+        crc.update(&payload);
+        let trailer = crc.finalize().to_le_bytes();
+        fs::create_dir_all(&self.dir)?;
+        let parts: [&[u8]; 3] = [&head, &payload, &trailer];
+        write_atomic(&self.dir, &snap_name(seq), &parts)?;
+        if let Err(pos) = self.seqs.binary_search(&seq) {
+            self.seqs.insert(pos, seq);
+        }
+        Ok(seq)
+    }
+    pub(crate) fn load_best<S: StateMachine>(&self, journal: &Journal, upto: u64) -> (S, u64) {
+        for &seq in self.seqs.iter().rev() {
+            if seq > upto {
+                continue;
+            }
+            if let Some(state) = self.load::<S>(journal, seq) {
+                return (state, seq);
+            }
+        }
+        (S::genesis(), 0)
+    }
+    fn load<S: StateMachine>(&self, journal: &Journal, seq: u64) -> Option<S> {
+        let bytes = fs::read(snap_path(&self.dir, seq)).ok()?;
+        let (body, trailer) = bytes.split_at(bytes.len().checked_sub(4)?);
+        if body.len() < HEADER || crc32fast::hash(body) != u32::from_le_bytes(trailer.try_into().ok()?) {
+            return None;
+        }
+        let u32_at = |o: usize| u32::from_le_bytes(body[o..o + 4].try_into().unwrap());
+        let u64_at = |o: usize| u64::from_le_bytes(body[o..o + 8].try_into().unwrap());
+        let valid = body[0..8] == MAGIC[..]
+            && u32_at(8) == FORMAT
+            && u32_at(12) == S::STATE_VERSION
+            && u64_at(16) == seq
+            && Some(u32_at(24)) == anchor_of(journal, seq);
+        if !valid {
+            return None;
+        }
+        let (state, rest) = postcard::take_from_bytes::<S>(&body[HEADER..]).ok()?;
+        rest.is_empty().then_some(state)
+    }
+    pub(crate) fn quarantine_after(&mut self, seq: u64) {
+        let keep = self.seqs.partition_point(|&s| s <= seq);
+        for s in self.seqs.drain(keep..) {
+            let path = snap_path(&self.dir, s);
+            let _ = fs::rename(&path, path.with_extension("orphan"));
+        }
+    }
+    pub(crate) fn prune(&mut self, keep_recent: usize, milestone_every: u64) {
+        let recent_from = self.seqs.len().saturating_sub(keep_recent);
+        let mut previous = None;
+        let mut kept = Vec::with_capacity(self.seqs.len());
+        for (i, &seq) in self.seqs.iter().enumerate() {
+            let bucket = (milestone_every != 0).then(|| seq / milestone_every);
+            let milestone = bucket.is_some() && bucket != previous;
+            previous = bucket;
+            if i >= recent_from || milestone {
+                kept.push(seq);
+            } else {
+                let _ = fs::remove_file(snap_path(&self.dir, seq));
+            }
+        }
+        self.seqs = kept;
+    }
+}
+fn snap_name(seq: u64) -> String {
+    format!("{seq:020}.snap")
+}
+fn snap_path(dir: &Path, seq: u64) -> PathBuf {
+    dir.join(snap_name(seq))
+}
+fn anchor_of(journal: &Journal, seq: u64) -> Option<u32> {
+    let frame = journal.frames_from(seq).next().filter(|f| f.seq == seq)?;
+    let mut h = crc32fast::Hasher::new();
+    h.update(&frame.seq.to_le_bytes());
+    h.update(frame.payload);
+    Some(h.finalize())
+}
+fn write_atomic(dir: &Path, name: &str, parts: &[&[u8]]) -> io::Result<()> {
+    let tmp = dir.join(format!("{name}.tmp"));
+    let written = (|| -> io::Result<()> {
+        let mut file = File::create(&tmp)?;
+        for part in parts {
+            file.write_all(part)?;
+        }
+        file.sync_all()?;
+        fs::rename(&tmp, dir.join(name))
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+        return written;
+    }
+    sync_dir(dir)
+}
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+#[cfg(not(unix))]
+fn sync_dir(_: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+
+
+========================================
+File: ./src/sys.rs
+========================================
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::time::Duration;
+pub(crate) const EPOLLIN: u32 = libc::EPOLLIN as u32;
+fn cvt(rc: libc::c_int) -> io::Result<libc::c_int> {
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(rc)
+    }
+}
+pub(crate) struct EventFd(OwnedFd);
+impl EventFd {
+    pub(crate) fn new() -> io::Result<Self> {
+        let raw = cvt(unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) })?;
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(raw) }))
+    }
+    pub(crate) fn notify(&self) {
+        let one = 1u64.to_ne_bytes();
+        loop {
+            let n = unsafe { libc::write(self.0.as_raw_fd(), one.as_ptr().cast(), one.len()) };
+            if n >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return;
+            }
+        }
+    }
+    pub(crate) fn drain(&self) {
+        let mut buf = [0u8; 8];
+        unsafe { libc::read(self.0.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+    }
+}
+impl AsRawFd for EventFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+pub(crate) struct Epoll(OwnedFd);
+impl Epoll {
+    pub(crate) fn new() -> io::Result<Self> {
+        let raw = cvt(unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) })?;
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(raw) }))
+    }
+    pub(crate) fn add(&self, fd: RawFd, token: u64, events: u32) -> io::Result<()> {
+        let mut event = libc::epoll_event { events, u64: token };
+        cvt(unsafe { libc::epoll_ctl(self.0.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut event) })?;
+        Ok(())
+    }
+    pub(crate) fn wait(&self, out: &mut Vec<u64>, timeout: Option<Duration>) -> io::Result<()> {
+        const MAX: usize = 64;
+        let millis = match timeout {
+            None => -1,
+            Some(d) => d.as_millis().min(i32::MAX as u128) as libc::c_int,
+        };
+        let mut events: Vec<libc::epoll_event> = Vec::with_capacity(MAX);
+        let n = unsafe {
+            libc::epoll_wait(self.0.as_raw_fd(), events.as_mut_ptr(), MAX as libc::c_int, millis)
+        };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            return if err.kind() == io::ErrorKind::Interrupted { Ok(()) } else { Err(err) };
+        }
+        unsafe { events.set_len(n as usize) };
+        out.extend(events.iter().map(|e| e.u64));
+        Ok(())
+    }
+}
+
+
+
+========================================
+File: ./src/tape.rs
+========================================
+#![allow(dead_code)]
+use crate::meta::{encode, sample_world, Prior, Sample, K_MAX, NONE, NSLOT, Q_MAX, ROW, Z_DIM};
+use crate::net::loss_raw;
+pub use crate::net::{decode, Adam, Stat, NB, NOUT};
+use crate::rng::Rng;
+pub const DC: usize = 16; 
+pub const DR: usize = 16; 
+pub const DW: usize = 192; 
+pub const NO: usize = 4; 
+const QB: usize = 2 + K_MAX * ROW; 
+pub fn cells(t: usize) -> usize {
+    3 * t + 6
+}
+#[derive(Clone, Copy, Debug)]
+pub struct Lay {
+    pub l1: usize,
+    pub l2: usize,
+    pub l0: usize,
+    pub a: usize,
+    pub gam: usize,
+    pub gg: usize,
+    pub bc: usize,
+    pub ua: usize,
+    pub uv: usize,
+    pub uvb: usize,
+    pub vw: usize,
+    pub vb: usize,
+    pub gw: usize,
+    pub gb: usize,
+    pub wo: usize,
+    pub vo: usize,
+    pub bo: usize,
+    pub total: usize,
+}
+impl Lay {
+    pub fn new() -> Lay {
+        let mut o = 0usize;
+        let mut take = |n: usize| -> usize {
+            let r = o;
+            o += n;
+            r
+        };
+        let l1 = take(DC * NSLOT);
+        let l2 = take(DC * NSLOT);
+        let l0 = take(DC);
+        let a = take(NO * DC * DC);
+        let gam = take(NO * DC);
+        let gg = take(NO * DC * DW);
+        let bc = take(DC);
+        let ua = take(DC);
+        let uv = take(DR * DC);
+        let uvb = take(DR);
+        let vw = take(DW * DR);
+        let vb = take(DW);
+        let gw = take(DW * Z_DIM);
+        let gb = take(DW);
+        let wo = take(NOUT * DR);
+        let vo = take(NOUT * DW);
+        let bo = take(NOUT);
+        Lay { l1, l2, l0, a, gam, gg, bc, ua, uv, uvb, vw, vb, gw, gb, wo, vo, bo, total: o }
+    }
+    pub fn groups(&self) -> Vec<(&'static str, usize, usize)> {
+        vec![
+            ("L1", self.l1, DC * NSLOT),
+            ("L2", self.l2, DC * NSLOT),
+            ("l0", self.l0, DC),
+            ("A", self.a, NO * DC * DC),
+            ("gam", self.gam, NO * DC),
+            ("Gam", self.gg, NO * DC * DW),
+            ("bc", self.bc, DC),
+            ("ua", self.ua, DC),
+            ("Uv", self.uv, DR * DC),
+            ("uvb", self.uvb, DR),
+            ("Vw", self.vw, DW * DR),
+            ("vb", self.vb, DW),
+            ("Gw", self.gw, DW * Z_DIM),
+            ("gb", self.gb, DW),
+            ("Wo", self.wo, NOUT * DR),
+            ("Vo", self.vo, NOUT * DW),
+            ("bo", self.bo, NOUT),
+        ]
+    }
+}
+pub struct Work {
+    n: usize,
+    z: Vec<f64>,
+    qz: Vec<f64>,
+    s: Vec<f64>,   
+    att: Vec<f64>, 
+    v: Vec<f64>,   
+    r: Vec<f64>,   
+    pw: Vec<f64>,  
+    w: Vec<f64>,   
+    gt: Vec<f64>,  
+    pub y: Vec<f64>,
+    dy: Vec<f64>,
+    ds: Vec<f64>,
+    dsn: Vec<f64>,
+    dl: Vec<f64>,
+    pub ticks: usize,  
+    pub capped: usize, 
+}
+fn grow(v: &mut Vec<f64>, len: usize) {
+    if v.len() < len {
+        v.resize(len, 0.0);
+    }
+}
+impl Work {
+    pub fn new() -> Work {
+        Work {
+            n: 0,
+            z: vec![0.0; Z_DIM],
+            qz: vec![0.0; DW],
+            s: Vec::new(),
+            att: Vec::new(),
+            v: Vec::new(),
+            r: Vec::new(),
+            pw: Vec::new(),
+            w: Vec::new(),
+            gt: Vec::new(),
+            y: Vec::new(),
+            dy: Vec::new(),
+            ds: Vec::new(),
+            dsn: Vec::new(),
+            dl: Vec::new(),
+            ticks: 0, 
+            capped: 0,
+        }
+    }
+    fn reserve(&mut self, t: usize, n: usize) {
+        let t = t.max(1);
+        grow(&mut self.s, t * n * DC);
+        grow(&mut self.att, t * n);
+        grow(&mut self.v, t * n * DR);
+        grow(&mut self.r, t * DR);
+        grow(&mut self.pw, t * DW);
+        grow(&mut self.w, t * DW);
+        grow(&mut self.gt, t * NO * DC);
+        grow(&mut self.y, t * NOUT);
+        grow(&mut self.dy, t * NOUT);
+        grow(&mut self.ds, n * DC);
+        grow(&mut self.dsn, n * DC);
+        grow(&mut self.dl, n);
+    }
+}
+fn xs(z: &[f64], i: usize) -> [f64; NSLOT] {
+    let mut x = [0.0f64; NSLOT];
+    if i < Q_MAX {
+        x.copy_from_slice(&z[QB + i * NSLOT..QB + (i + 1) * NSLOT]);
+    } else {
+        x[NONE] = 1.0;
+    }
+    x
+}
+fn fill(rng: &mut Rng, v: &mut [f64], sd: f64) {
+    for x in v.iter_mut() {
+        *x = sd * rng.normal() as f64;
+    }
+}
+pub struct Net {
+    pub lay: Lay,
+    pub p: Vec<f64>,
+    pub rho: f64,
+}
+impl Net {
+    pub fn new(rng: &mut Rng) -> Net {
+        let lay = Lay::new();
+        let l = lay;
+        let mut p = vec![0.0f64; lay.total];
+        fill(rng, &mut p[l.l1..l.l1 + DC * NSLOT], 0.5);
+        fill(rng, &mut p[l.l2..l.l2 + DC * NSLOT], 0.5);
+        fill(rng, &mut p[l.a..l.a + NO * DC * DC], 0.15);
+        for d in 0..DC {
+            p[l.a + d * DC + d] += 1.0; 
+            p[l.gam + d] = 2.0; 
+        }
+        for i in DC..NO * DC {
+            p[l.gam + i] = 0.3;
+        }
+        fill(rng, &mut p[l.gg..l.gg + NO * DC * DW], 0.05);
+        fill(rng, &mut p[l.ua..l.ua + DC], 0.5);
+        fill(rng, &mut p[l.uv..l.uv + DR * DC], 0.25);
+        fill(rng, &mut p[l.vw..l.vw + DW * DR], 0.25);
+        for i in 0..DW {
+            p[l.vb + i] = 0.5;
+        }
+        fill(rng, &mut p[l.gw..l.gw + DW * Z_DIM], 0.15);
+        fill(rng, &mut p[l.wo..l.wo + NOUT * DR], 0.03);
+        fill(rng, &mut p[l.vo..l.vo + NOUT * DW], 0.03);
+        Net { lay, p, rho: f64::INFINITY }
+    }
+    pub fn forward(&self, z32: &[f32], t: usize, ws: &mut Work) {
+        let (l, p) = (&self.lay, &self.p);
+        let n = cells(t);
+        ws.reserve(t, n);
+        ws.n = n;
+        for i in 0..Z_DIM {
+            ws.z[i] = z32[i] as f64;
+        }
+        for u in 0..DW {
+            let row = &p[l.gw + u * Z_DIM..l.gw + (u + 1) * Z_DIM];
+            let mut a = p[l.gb + u];
+            for c in 0..Z_DIM {
+                a += row[c] * ws.z[c];
+            }
+            ws.qz[u] = a;
+        }
+        for i in 0..n {
+            let xi = xs(&ws.z, i);
+            let xp = if i > 0 { xs(&ws.z, i - 1) } else { [0.0; NSLOT] };
+            for d in 0..DC {
+                let mut a = p[l.l0 + d];
+                for c in 0..NSLOT {
+                    a += p[l.l1 + d * NSLOT + c] * xi[c] + p[l.l2 + d * NSLOT + c] * xp[c];
+                }
+                ws.s[i * DC + d] = a.tanh();
+            }
+        }
+        for k in 0..t {
+            let na = n.min(3 * k + 1);
+            let (sa, sb) = ws.s.split_at_mut((k + 1) * n * DC);
+            let sk = &sa[k * n * DC..];
+            let mut mx = f64::NEG_INFINITY;
+            for i in 0..na {
+                let mut lg = 0.0;
+                for d in 0..DC {
+                    lg += p[l.ua + d] * sk[i * DC + d];
+                }
+                ws.att[k * n + i] = lg;
+                if lg > mx {
+                    mx = lg;
+                }
+            }
+            let mut sum = 0.0;
+            for i in 0..na {
+                let e = (ws.att[k * n + i] - mx).exp();
+                ws.att[k * n + i] = e;
+                sum += e;
+            }
+            let rk = &mut ws.r[k * DR..(k + 1) * DR];
+            for x in rk.iter_mut() {
+                *x = 0.0;
+            }
+            for i in 0..na {
+                let a = ws.att[k * n + i] / sum;
+                ws.att[k * n + i] = a;
+                for j in 0..DR {
+                    let mut vj = p[l.uvb + j];
+                    for d in 0..DC {
+                        vj += p[l.uv + j * DC + d] * sk[i * DC + d];
+                    }
+                    ws.v[(k * n + i) * DR + j] = vj;
+                    rk[j] += a * vj;
+                }
+            }
+            for u in 0..DW {
+                let mut a = p[l.vb + u];
+                for j in 0..DR {
+                    a += p[l.vw + u * DR + j] * rk[j];
+                }
+                ws.pw[k * DW + u] = a;
+                ws.w[k * DW + u] = a * ws.qz[u];
+            }
+            for o in 0..NO {
+                for d in 0..DC {
+                    let row = &p[l.gg + (o * DC + d) * DW..l.gg + (o * DC + d + 1) * DW];
+                    let mut g = p[l.gam + o * DC + d];
+                    for u in 0..DW {
+                        g += row[u] * ws.w[k * DW + u];
+                    }
+                    ws.gt[(k * NO + o) * DC + d] = g;
+                }
+            }
+            for o in 0..NOUT {
+                let mut a = p[l.bo + o];
+                for j in 0..DR {
+                    a += p[l.wo + o * DR + j] * rk[j];
+                }
+                for u in 0..DW {
+                    a += p[l.vo + o * DW + u] * ws.w[k * DW + u];
+                }
+                ws.y[k * NOUT + o] = a;
+            }
+            if k + 1 < t {
+                let sn = &mut sb[0..n * DC];
+                for i in 0..n {
+                    for d in 0..DC {
+                        let mut a = p[l.bc + d];
+                        for o in 0..NO.min(i + 1) {
+                            let src = &sk[(i - o) * DC..(i - o + 1) * DC];
+                            let row = &p[l.a + (o * DC + d) * DC..l.a + (o * DC + d + 1) * DC];
+                            let mut u = 0.0;
+                            for c in 0..DC {
+                                u += row[c] * src[c];
+                            }
+                            a += ws.gt[(k * NO + o) * DC + d] * u;
+                        }
+                        sn[i * DC + d] = a.tanh();
+                    }
+                }
+            }
+        }
+    }
+    pub fn backward(&self, t: usize, ws: &mut Work, g: &mut [f64]) {
+        let (l, p) = (&self.lay, &self.p);
+        let n = ws.n;
+        let mut dqz = [0.0f64; DW];
+        let mut dw = [0.0f64; DW];
+        let mut dr = [0.0f64; DR];
+        let mut dg = [0.0f64; NO * DC];
+        for x in ws.ds[..n * DC].iter_mut() {
+            *x = 0.0;
+        }
+        for k in (0..t).rev() {
+            let na = n.min(3 * k + 1);
+            for x in dg.iter_mut() {
+                *x = 0.0;
+            }
+            for x in dw.iter_mut() {
+                *x = 0.0;
+            }
+            for x in dr.iter_mut() {
+                *x = 0.0;
+            }
+            if k + 1 < t {
+                let sk = &ws.s[k * n * DC..(k + 1) * n * DC];
+                let sn = &ws.s[(k + 1) * n * DC..(k + 2) * n * DC];
+                for i in 0..n {
+                    for d in 0..DC {
+                        let sv = sn[i * DC + d];
+                        let da = ws.dsn[i * DC + d] * (1.0 - sv * sv);
+                        if da == 0.0 {
+                            continue;
+                        }
+                        g[l.bc + d] += da;
+                        for o in 0..NO.min(i + 1) {
+                            let src = &sk[(i - o) * DC..(i - o + 1) * DC];
+                            let ro = l.a + (o * DC + d) * DC;
+                            let mut u = 0.0;
+                            for c in 0..DC {
+                                u += p[ro + c] * src[c];
+                            }
+                            dg[o * DC + d] += da * u;
+                            let du = da * ws.gt[(k * NO + o) * DC + d];
+                            for c in 0..DC {
+                                g[ro + c] += du * src[c];
+                                ws.ds[(i - o) * DC + c] += p[ro + c] * du;
+                            }
+                        }
+                    }
+                }
+            }
+            if k + 1 < t && self.rho.is_finite() {
+                let nn = n * DC;
+                let nr = ws.dsn[..nn].iter().map(|x| x * x).sum::<f64>().sqrt();
+                let nc = ws.ds[..nn].iter().map(|x| x * x).sum::<f64>().sqrt();
+                ws.ticks += 1;
+                if nc > self.rho * nr {
+                    let sc = self.rho * nr / nc;
+                    for x in ws.ds[..nn].iter_mut() {
+                        *x *= sc;
+                    }
+                    ws.capped += 1;
+                }
+            }
+            for o in 0..NO {
+                for d in 0..DC {
+                    let v = dg[o * DC + d];
+                    if v == 0.0 {
+                        continue;
+                    }
+                    g[l.gam + o * DC + d] += v;
+                    let ro = l.gg + (o * DC + d) * DW;
+                    for u in 0..DW {
+                        g[ro + u] += v * ws.w[k * DW + u];
+                        dw[u] += p[ro + u] * v;
+                    }
+                }
+            }
+            for o in 0..NOUT {
+                let d = ws.dy[k * NOUT + o];
+                if d == 0.0 {
+                    continue;
+                }
+                g[l.bo + o] += d;
+                for j in 0..DR {
+                    g[l.wo + o * DR + j] += d * ws.r[k * DR + j];
+                    dr[j] += p[l.wo + o * DR + j] * d;
+                }
+                for u in 0..DW {
+                    g[l.vo + o * DW + u] += d * ws.w[k * DW + u];
+                    dw[u] += p[l.vo + o * DW + u] * d;
+                }
+            }
+            for u in 0..DW {
+                let dwu = dw[u];
+                if dwu == 0.0 {
+                    continue;
+                }
+                let dpw = dwu * ws.qz[u];
+                dqz[u] += dwu * ws.pw[k * DW + u];
+                g[l.vb + u] += dpw;
+                for j in 0..DR {
+                    g[l.vw + u * DR + j] += dpw * ws.r[k * DR + j];
+                    dr[j] += p[l.vw + u * DR + j] * dpw;
+                }
+            }
+            let mut ssum = 0.0;
+            for i in 0..na {
+                let mut da = 0.0;
+                for j in 0..DR {
+                    da += dr[j] * ws.v[(k * n + i) * DR + j];
+                }
+                ws.dl[i] = da;
+                ssum += ws.att[k * n + i] * da;
+            }
+            for i in 0..na {
+                let a = ws.att[k * n + i];
+                let dl = a * (ws.dl[i] - ssum);
+                let si = &ws.s[(k * n + i) * DC..(k * n + i + 1) * DC];
+                for j in 0..DR {
+                    let dv = a * dr[j];
+                    g[l.uvb + j] += dv;
+                    for d in 0..DC {
+                        g[l.uv + j * DC + d] += dv * si[d];
+                        ws.ds[i * DC + d] += p[l.uv + j * DC + d] * dv;
+                    }
+                }
+                for d in 0..DC {
+                    g[l.ua + d] += dl * si[d];
+                    ws.ds[i * DC + d] += dl * p[l.ua + d];
+                }
+            }
+            std::mem::swap(&mut ws.ds, &mut ws.dsn);
+            for x in ws.ds[..n * DC].iter_mut() {
+                *x = 0.0;
+            }
+        }
+        for i in 0..n {
+            let xi = xs(&ws.z, i);
+            let xp = if i > 0 { xs(&ws.z, i - 1) } else { [0.0; NSLOT] };
+            for d in 0..DC {
+                let s0 = ws.s[i * DC + d];
+                let da = ws.dsn[i * DC + d] * (1.0 - s0 * s0);
+                g[l.l0 + d] += da;
+                for c in 0..NSLOT {
+                    g[l.l1 + d * NSLOT + c] += da * xi[c];
+                    g[l.l2 + d * NSLOT + c] += da * xp[c];
+                }
+            }
+        }
+        for u in 0..DW {
+            g[l.gb + u] += dqz[u];
+            if dqz[u] == 0.0 {
+                continue;
+            }
+            for c in 0..Z_DIM {
+                g[l.gw + u * Z_DIM + c] += dqz[u] * ws.z[c];
+            }
+        }
+    }
+    pub fn run_sample(&self, s: &Sample, w_trace: f64, ws: &mut Work, g: Option<&mut [f64]>) -> Stat {
+        let mut z = [0f32; Z_DIM];
+        encode(&s.prog, &s.view, &mut z);
+        self.forward(&z, s.t, ws);
+        let st = loss_raw(s, w_trace, &ws.y, &mut ws.dy);
+        if let Some(g) = g {
+            self.backward(s.t, ws, g);
+        }
+        st
+    }
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        let mut buf = Vec::with_capacity(12 + self.p.len() * 8);
+        buf.extend_from_slice(b"M0T1");
+        buf.extend_from_slice(&(self.p.len() as u64).to_le_bytes());
+        for x in &self.p {
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        std::fs::write(path, buf)
+    }
+    pub fn load(path: &str) -> std::io::Result<Net> {
+        let buf = std::fs::read(path)?;
+        let mut net = Net::new(&mut Rng::new(0));
+        if buf.len() != 12 + net.p.len() * 8 || buf[..4] != b"M0T1"[..] {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "fichier modèle invalide (substrat bande attendu)",
+            ));
+        }
+        for (i, c) in buf[12..].chunks_exact(8).enumerate() {
+            net.p[i] = f64::from_le_bytes(c.try_into().unwrap());
+        }
+        Ok(net)
+    }
+}
+pub fn gradcheck(seed: u64) -> bool {
+    let pr = Prior::demo();
+    let mut rng = Rng::new(seed);
+    let mut net = Net::new(&mut rng);
+    let lay = net.lay;
+    assert_eq!(lay.groups().iter().map(|g| g.2).sum::<usize>(), lay.total);
+    println!(
+        "D (bande) : {} paramètres ; cellule {} unités, bus de lecture {}, bus d'écriture {}",
+        net.p.len(),
+        DC,
+        DR,
+        DW
+    );
+    for &(off, len) in &[(lay.l0, DC), (lay.bc, DC), (lay.uvb, DR), (lay.vb, DW), (lay.gb, DW), (lay.bo, NOUT)] {
+        for i in 0..len {
+            net.p[off + i] += 0.1 * rng.normal() as f64;
+        }
+    }
+    let samples: Vec<Sample> = (0..6).map(|_| sample_world(&mut rng, &pr, 100_000).expect("monde")).collect();
+    let mut ws = Work::new();
+    let mut z = [0f32; Z_DIM];
+    encode(&samples[0].prog, &samples[0].view, &mut z);
+    net.forward(&z, 16, &mut ws);
+    let long: Vec<f64> = ws.y[..8 * NOUT].to_vec();
+    net.forward(&z, 8, &mut ws);
+    let causal = ws.y[..8 * NOUT] == long[..];
+    println!("causalité (y_k indépendant de T et de n) : {}", if causal { "ok" } else { "ÉCHEC" });
+    let total = |n: &Net, w: &mut Work| -> f64 {
+        samples.iter().map(|s| n.run_sample(s, 1.0, w, None).loss).sum::<f64>()
+    };
+    let mut ga = vec![0.0f64; net.p.len()];
+    for s in &samples {
+        net.run_sample(s, 1.0, &mut ws, Some(&mut ga[..]));
+    }
+    let eps = 1e-5;
+    let mut ok = causal;
+    println!("{:<4} {:>10} {:>10} {:>10}", "grp", "|g| max", "err abs", "err rel*");
+    for (name, off, len) in lay.groups() {
+        let mut idx: Vec<usize> = (0..len).collect();
+        idx.sort_by(|&a, &b| ga[off + b].abs().total_cmp(&ga[off + a].abs()));
+        let gmax = ga[off + idx[0]].abs();
+        let nt = 8.min(len);
+        let mut probes: Vec<usize> = idx[..nt].to_vec();
+        for _ in 0..8 {
+            probes.push(rng.below(len));
+        }
+        let (mut eabs, mut erel) = (0.0f64, 0.0f64);
+        for (q, &i) in probes.iter().enumerate() {
+            let j = off + i;
+            let x0 = net.p[j];
+            net.p[j] = x0 + eps;
+            let lp = total(&net, &mut ws);
+            net.p[j] = x0 - eps;
+            let lm = total(&net, &mut ws);
+            net.p[j] = x0;
+            let gn = (lp - lm) / (2.0 * eps);
+            let d = (ga[j] - gn).abs();
+            eabs = eabs.max(d);
+            if q < nt {
+                erel = erel.max(d / ga[j].abs().max(gn.abs()).max(1e-300));
+            }
+        }
+        let good = gmax > 0.0 && erel < 1e-4 && eabs < 1e-6;
+        ok &= good;
+        println!("{:<4} {:>10.3e} {:>10.2e} {:>10.2e}  {}", name, gmax, eabs, erel, if good { "ok" } else { "ÉCHEC" });
+    }
+    println!("(* erreur relative sur les 8 plus grands gradients du groupe ; seuils : rel < 1e-4, abs < 1e-6)");
+    println!("{}", if ok { "GRADCHECK OK" } else { "GRADCHECK ÉCHEC" });
+    ok
+}
+
+
+
+========================================
+File: ./src/train.rs
+========================================
+#![allow(dead_code)]
+use crate::eval::{draw_world, in_part, nontrivial, validate, Agg, Part};
+use crate::meta::{mutate_sample, Prior, Sample};
+use crate::rng::Rng;
+use crate::tape::{Adam, Net, Work};
+use std::time::Instant;
+pub struct Cfg {
+    pub seed: u64,
+    pub steps: usize,
+    pub batch: usize,
+    pub threads: usize,
+    pub lr: f64,           
+    pub lr_stage: f64,     
+    pub warm: usize,       
+    pub lr_min: f64,       
+    pub cycle: usize,      
+    pub max_cycles: usize, 
+    pub peak_decay: f64,   
+    pub clip: f64,
+    pub rho: f64,          
+    pub w_trace: f64,
+    pub mut_frac: f64,
+    pub up: f64,           
+    pub gate: f64,         
+    pub every: usize,      
+    pub n_val: usize,
+    pub n_gate: usize,     
+    pub secs: f64,         
+    pub from: usize,       
+    pub kmax: usize,       
+    pub trunc: bool,       
+    pub fixed: Option<(usize, usize)>, 
+    pub out: String,
+    pub init: String,
+}
+pub fn stages(fin: &Prior) -> Vec<Prior> {
+    let t0 = 6usize.max(fin.t_lo);
+    let q0 = 3usize.max(fin.q_lo);
+    let nt = (fin.t_hi.saturating_sub(t0) + 1) / 2;
+    let nq = fin.q_hi.saturating_sub(q0);
+    let n = nt.max(nq) + 1;
+    (0..n)
+        .map(|i| {
+            let mut p = fin.clone();
+            p.t_hi = (t0 + 2 * i).min(fin.t_hi);
+            p.q_hi = (q0 + i).min(fin.q_hi);
+            p
+        })
+        .collect()
+}
+pub fn save_ref(path: &str, p: &Prior) {
+    let _ = std::fs::write(format!("{}.ref", path), format!("{} {} {}", p.t_hi, p.q_hi, p.k_max));
+}
+pub fn load_ref(path: &str) -> Option<(usize, usize, usize)> {
+    let s = std::fs::read_to_string(format!("{}.ref", path)).ok()?;
+    let mut it = s.split_whitespace().map(|x| x.parse::<usize>());
+    let t = it.next()?.ok()?;
+    let q = it.next()?.ok()?;
+    let k = it.next()?.ok()?;
+    Some((t, q, k))
+}
+fn checkpoint(net: &Net, out: &str, p: &Prior) {
+    if let Err(e) = net.save(out) {
+        eprintln!("sauvegarde impossible ({}) : {}", out, e);
+    }
+    save_ref(out, p);
+}
+pub fn draw_train(rng: &mut Rng, pr: &Prior, mut_frac: f64) -> Sample {
+    let par = draw_world(rng, pr, Part::Train, 1_000_000).expect("prior d'entraînement vide");
+    if rng.bernoulli(mut_frac) {
+        if let Some(c) = mutate_sample(rng, &par, pr, 200) {
+            if in_part(&c.prog, Part::Train) {
+                return c;
+            }
+        }
+    }
+    par
+}
+struct Worker {
+    rng: Rng,
+    ws: Work,
+    g: Vec<f64>,
+}
+impl Worker {
+    fn new(rng: Rng, np: usize) -> Worker {
+        Worker { rng, ws: Work::new(), g: vec![0.0; np] }
+    }
+    fn run(&mut self, net: &Net, pr: &Prior, n: usize, mut_frac: f64, w_trace: f64) -> Agg {
+        for x in self.g.iter_mut() {
+            *x = 0.0;
+        }
+        self.ws.ticks = 0;
+        self.ws.capped = 0;
+        let mut a = Agg::default();
+        for _ in 0..n {
+            let s = draw_train(&mut self.rng, pr, mut_frac);
+            let st = net.run_sample(&s, w_trace, &mut self.ws, Some(&mut self.g[..]));
+            if nontrivial(&s) {
+                a.add(&s, &st);
+            }
+        }
+        a
+    }
+}
+pub fn train(cfg: &Cfg) -> (Net, Prior) {
+    let mut fin = Prior::demo();
+    fin.k_max = cfg.kmax;
+    fin.trunc = cfg.trunc;
+    let sts: Vec<Prior> = match cfg.fixed {
+        Some((t, q)) => {
+            let mut p = fin.clone();
+            p.t_hi = t.max(p.t_lo);
+            p.q_hi = q.max(p.q_lo);
+            vec![p]
+        }
+        None => stages(&fin),
+    };
+    let nst = sts.len();
+    let mut rng = Rng::new(cfg.seed);
+    let mut net = Net::new(&mut rng);
+    if !cfg.init.is_empty() {
+        match Net::load(&cfg.init) {
+            Ok(n) => {
+                net = n;
+                println!("poids initiaux : {}", cfg.init);
+            }
+            Err(e) => {
+                eprintln!("--init {} : {}", cfg.init, e);
+                std::process::exit(1);
+            }
+        }
+    }
+    net.rho = cfg.rho;
+    let np = net.p.len();
+    let nth = cfg.threads.clamp(1, cfg.batch.max(1));
+    let mut workers: Vec<Worker> = (0..nth).map(|_| Worker::new(rng.fork(), np)).collect();
+    let mut vrng = rng.fork();
+    let mut vws = Work::new();
+    let mut adam = Adam::new(np);
+    let mut g = vec![0.0f64; np];
+    let groups = net.lay.groups();
+    let mut gq = vec![0.0f64; groups.len()];
+    let (mut cap_t, mut cap_c) = (0usize, 0usize);
+    let cycle = cfg.cycle.max(1);
+    let every = cfg.every.max(1);
+    let mut stage = cfg.from.min(nst - 1);
+    let stage0 = stage;
+    println!(
+        "entraînement de D (v4) : {} paramètres, {} fil(s), lot {}, {} étage(s){}, départ étage {}, k ≤ {}, mutés {:.2}",
+        np,
+        nth,
+        cfg.batch,
+        nst,
+        if cfg.fixed.is_some() { " (plage fixe)" } else { "" },
+        stage + 1,
+        fin.k_max,
+        cfg.mut_frac
+    );
+    println!(
+        "lr {:.1e} (étages suivants {:.1e}, montée {} pas) → {:.1e} par cycle de {} pas (crête ×{:.2} par cycle de plus), ≤ {} cycles/étage ; plafond de gain rétrograde ρ = {} ; portes : up {:.0}% / final {:.0}% (n = {})",
+        cfg.lr,
+        cfg.lr_stage,
+        cfg.warm,
+        cfg.lr_min,
+        cycle,
+        cfg.peak_decay,
+        cfg.max_cycles,
+        cfg.rho,
+        100.0 * cfg.up,
+        100.0 * cfg.gate,
+        cfg.n_gate
+    );
+    println!(
+        "génération : {}",
+        if cfg.trunc { "troncature (horizon coupé au dernier tick dont la file lue est ≤ q)" } else { "rejet par qmax (v1)" }
+    );
+    println!("étage {}/{} : T ≤ {}, qmax ≤ {}", stage + 1, nst, sts[stage].t_hi, sts[stage].q_hi);
+    let clock = Instant::now();
+    let (mut cyc, mut k, mut step, mut done) = (0usize, 0usize, 0usize, 0usize);
+    let mut win = Agg::default();
+    let (mut gsum, mut gcnt, mut bad) = (0.0f64, 0usize, 0usize);
+    let mut why = "plafond de pas";
+    let mut last_stage = stage;
+    while step < cfg.steps {
+        let pr = &sts[stage];
+        last_stage = stage;
+        let first = if stage > stage0 { cfg.lr_stage } else { cfg.lr };
+        let peak = (first * cfg.peak_decay.powi(cyc as i32)).max(cfg.lr_min);
+        let mut lr = cfg.lr_min
+            + 0.5 * (peak - cfg.lr_min) * (1.0 + (std::f64::consts::PI * k as f64 / cycle as f64).cos());
+        if stage > stage0 && cyc == 0 && k < cfg.warm {
+            lr *= (k + 1) as f64 / cfg.warm as f64;
+        }
+        let (base, extra) = (cfg.batch / nth, cfg.batch % nth);
+        let mut aggs: Vec<Agg> = Vec::with_capacity(nth);
+        std::thread::scope(|sc| {
+            let mut hs = Vec::with_capacity(nth);
+            for (i, w) in workers.iter_mut().enumerate() {
+                let n = base + usize::from(i < extra);
+                let netr = &net;
+                hs.push(sc.spawn(move || w.run(netr, pr, n, cfg.mut_frac, cfg.w_trace)));
+            }
+            for h in hs {
+                aggs.push(h.join().expect("fil d'entraînement"));
+            }
+        });
+        for x in g.iter_mut() {
+            *x = 0.0;
+        }
+        for w in &workers {
+            for (a, b) in g.iter_mut().zip(&w.g) {
+                *a += *b;
+            }
+            cap_t += w.ws.ticks;
+            cap_c += w.ws.capped;
+        }
+        let inv = 1.0 / cfg.batch as f64;
+        for x in g.iter_mut() {
+            *x *= inv;
+        }
+        for (i, &(_, off, len)) in groups.iter().enumerate() {
+            gq[i] += g[off..off + len].iter().map(|x| x * x).sum::<f64>();
+        }
+        let gn = adam.step(&mut net.p, &g, lr, cfg.clip);
+        if gn.is_finite() {
+            gsum += gn;
+            gcnt += 1;
+        } else {
+            bad += 1;
+        }
+        for a in &aggs {
+            win.merge(a);
+        }
+        done += cfg.batch;
+        step += 1;
+        k += 1;
+        let timeout = cfg.secs > 0.0 && clock.elapsed().as_secs_f64() >= cfg.secs;
+        let cyc_end = k >= cycle;
+        if step % every == 0 || cyc_end || timeout {
+            let nv = if cyc_end { cfg.n_gate } else { cfg.n_val };
+            let v = validate(&net, pr, nv, &mut vrng, &mut vws);
+            let el = clock.elapsed().as_secs_f64();
+            let tot_q = gq.iter().sum::<f64>().max(1e-300);
+            let mut ord: Vec<usize> = (0..groups.len()).collect();
+            ord.sort_by(|&a, &b| gq[b].total_cmp(&gq[a]));
+            let top: Vec<String> = ord
+                .iter()
+                .take(3)
+                .map(|&i| format!("{} {:.0}%", groups[i].0, 100.0 * gq[i] / tot_q))
+                .collect();
+            println!(
+                "pas {:>6}  étage {}/{} (T≤{}, q≤{})  cycle {}/{}  lr {:.1e}  L {:.4}  train {:>5.1}%  val {:>5.1}% ±{:.1}{}  |g| {:.3}  plaf {:.0}%  énergie {}  {:.0} éch/s  {:.0} s",
+                step,
+                stage + 1,
+                nst,
+                pr.t_hi,
+                pr.q_hi,
+                cyc + 1,
+                cfg.max_cycles,
+                lr,
+                win.mean_loss(),
+                100.0 * win.fid(),
+                100.0 * v.fid(),
+                100.0 * v.ci(),
+                if cyc_end { " [porte]" } else { "" },
+                gsum / gcnt.max(1) as f64,
+                100.0 * cap_c as f64 / cap_t.max(1) as f64,
+                top.join(" "),
+                done as f64 / el.max(1e-9),
+                el
+            );
+            if bad > 0 {
+                println!("  ! {} pas ignorés (gradient non fini)", bad);
+            }
+            win = Agg::default();
+            gsum = 0.0;
+            gcnt = 0;
+            bad = 0;
+            cap_t = 0;
+            cap_c = 0;
+            for x in gq.iter_mut() {
+                *x = 0.0;
+            }
+            checkpoint(&net, &cfg.out, pr);
+            if cyc_end {
+                let is_final = stage + 1 == nst;
+                let thr = if is_final { cfg.gate } else { cfg.up };
+                if v.fid() >= thr {
+                    if is_final {
+                        why = "étage final maîtrisé";
+                        break;
+                    }
+                    let zs = validate(&net, &sts[stage + 1], cfg.n_gate, &mut vrng, &mut vws);
+                    println!(
+                        "  ↑ porte franchie ({:.1}% ≥ {:.0}%) → étage {}/{} : T ≤ {}, qmax ≤ {}",
+                        100.0 * v.fid(),
+                        100.0 * thr,
+                        stage + 2,
+                        nst,
+                        sts[stage + 1].t_hi,
+                        sts[stage + 1].q_hi
+                    );
+                    println!(
+                        "    zéro-coup (poids de fin d'étage sur la plage suivante) : fid {:.1}% ±{:.1} (n = {})",
+                        100.0 * zs.fid(),
+                        100.0 * zs.ci(),
+                        zs.n
+                    );
+                    stage += 1;
+                    cyc = 0;
+                } else {
+                    cyc += 1;
+                    println!(
+                        "  ✗ porte close ({:.1}% < {:.0}%) : {} cycle(s) sur {} dans l'étage {}/{}",
+                        100.0 * v.fid(),
+                        100.0 * thr,
+                        cyc,
+                        cfg.max_cycles,
+                        stage + 1,
+                        nst
+                    );
+                    if cyc >= cfg.max_cycles {
+                        why = if cfg.fixed.is_some() {
+                            "plan fixe terminé (cycles épuisés)"
+                        } else {
+                            "étage BLOQUÉ (porte jamais franchie)"
+                        };
+                        break;
+                    }
+                }
+                k = 0;
+            }
+            if timeout {
+                why = "plafond de temps";
+                break;
+            }
+        }
+    }
+    checkpoint(&net, &cfg.out, &sts[last_stage]);
+    println!(
+        "fin : {} — dernier étage entraîné {}/{} ; {} pas, {} échantillons, {:.0} s",
+        why,
+        last_stage + 1,
+        nst,
+        step,
+        done,
+        clock.elapsed().as_secs_f64()
+    );
+    let p = sts[last_stage].clone();
+    (net, p)
+}
+
+
+
+========================================
+File: ./tests/engine.rs
+========================================
+use std::io::{Read, Seek, SeekFrom, Write};
+use chronicle::kv::{Kv, KvEvent};
+use chronicle::{Engine, Journal};
+fn put(k: &str, v: &str) -> KvEvent {
+    KvEvent::Put { key: k.as_bytes().to_vec(), value: v.as_bytes().to_vec() }
+}
+fn del(k: &str) -> KvEvent {
+    KvEvent::Delete { key: k.as_bytes().to_vec() }
+}
+#[test]
+fn state_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kv.log");
+    {
+        let (mut db, rec) = Engine::<Kv>::open(&path).unwrap();
+        assert_eq!(rec.frames, 0);
+        assert_eq!(db.submit(&put("a", "1")).unwrap(), 1);
+        assert_eq!(db.submit(&put("b", "2")).unwrap(), 2);
+        db.submit(&del("a")).unwrap();
+        db.commit().unwrap();
+    }
+    let (db, rec) = Engine::<Kv>::open(&path).unwrap();
+    assert_eq!(rec.frames, 3);
+    assert_eq!(db.last_seq(), 3);
+    assert_eq!(db.state().get(b"a"), None);
+    assert_eq!(db.state().get(b"b"), Some(&b"2"[..]));
+}
+#[test]
+fn time_travel_replays_any_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut db, _) = Engine::<Kv>::open(dir.path().join("kv.log")).unwrap();
+    db.submit(&put("k", "v1")).unwrap();
+    db.submit(&put("k", "v2")).unwrap();
+    db.submit(&del("k")).unwrap();
+    assert!(db.state_at(0).unwrap().is_empty());
+    assert_eq!(db.state_at(1).unwrap().get(b"k"), Some(&b"v1"[..]));
+    assert_eq!(db.state_at(2).unwrap().get(b"k"), Some(&b"v2"[..]));
+    assert_eq!(db.state_at(3).unwrap().get(b"k"), None);
+    assert!(db.state_at(4).is_err());
+}
+#[test]
+fn corrupted_tail_is_discarded_and_log_stays_appendable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kv.log");
+    let tail = {
+        let (mut db, _) = Engine::<Kv>::open(&path).unwrap();
+        for i in 0..5 {
+            db.submit(&put(&format!("k{i}"), "v")).unwrap();
+        }
+        db.commit().unwrap();
+        db.journal().tail()
+    };
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    let mut byte = [0u8; 1];
+    f.seek(SeekFrom::Start(tail - 1)).unwrap();
+    f.read_exact(&mut byte).unwrap();
+    f.seek(SeekFrom::Start(tail - 1)).unwrap();
+    f.write_all(&[byte[0] ^ 0xFF]).unwrap();
+    drop(f);
+    let (mut db, rec) = Engine::<Kv>::open(&path).unwrap();
+    assert_eq!(rec.frames, 4);
+    assert!(rec.discarded_bytes > 0);
+    assert_eq!(db.state().len(), 4);
+    assert_eq!(db.submit(&put("after", "crash")).unwrap(), 5);
+    db.commit().unwrap();
+    drop(db);
+    let (db, rec) = Engine::<Kv>::open(&path).unwrap();
+    assert_eq!((rec.frames, rec.discarded_bytes), (5, 0));
+    assert_eq!(db.state().get(b"after"), Some(&b"crash"[..]));
+}
+#[test]
+fn recovery_from_every_cut_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kv.log");
+    let (mut reference, _) = Engine::<Kv>::open(&path).unwrap();
+    for i in 0..20 {
+        reference.submit(&put(&format!("k{}", i % 7), &format!("v{i}"))).unwrap();
+    }
+    reference.commit().unwrap();
+    let tail = reference.journal().tail() as usize;
+    let image_len = tail.next_multiple_of(4096);
+    let image = std::fs::read(&path).unwrap()[..image_len].to_vec();
+    let mut previous = 0;
+    for cut in 16..=tail {
+        let mut bytes = image.clone();
+        bytes[cut..].fill(0);
+        let copy = dir.path().join("cut.log");
+        std::fs::write(&copy, &bytes).unwrap();
+        let (db, rec) = Engine::<Kv>::open(&copy).unwrap();
+        assert!(rec.frames >= previous, "cut {cut}");
+        previous = rec.frames;
+        assert_eq!(db.state(), &reference.state_at(rec.frames).unwrap(), "cut {cut}");
+        drop(db);
+        std::fs::remove_file(&copy).unwrap();
+    }
+    assert_eq!(previous, 20);
+}
+#[test]
+fn journal_grows_and_seeks_by_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raw.log");
+    {
+        let (mut j, _) = Journal::open_with_capacity(&path, 4096).unwrap();
+        for i in 0..3000u32 {
+            assert_eq!(j.append(&i.to_le_bytes()).unwrap(), i as u64 + 1);
+        }
+        j.sync().unwrap();
+    }
+    let (j, rec) = Journal::open(&path).unwrap();
+    assert_eq!(rec.frames, 3000);
+    let f = j.frames_from(2049).next().unwrap();
+    assert_eq!(f.seq, 2049);
+    assert_eq!(f.payload, &2048u32.to_le_bytes()[..]);
+    assert_eq!(j.frames_from(2990).count(), 11);
+    assert_eq!(j.frames_from(3001).count(), 0);
+}
+#[cfg(unix)]
+#[test]
+fn second_open_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kv.log");
+    let first = Journal::open(&path).unwrap();
+    assert!(matches!(Journal::open(&path), Err(chronicle::Error::Locked)));
+    drop(first);
+    assert!(Journal::open(&path).is_ok());
+}
+
+
+
+========================================
+File: ./tests/runtime.rs
+========================================
+#![cfg(target_os = "linux")]
+use std::io::Write;
+use std::marker::PhantomData;
+use std::path::Path;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+use chronicle::kv::{Kv, KvEvent};
+use chronicle::{block_on, Engine, Error, Handle, Options, Server, StateMachine};
+use serde::{Deserialize, Serialize};
+fn put(k: &str, v: &str) -> KvEvent {
+    KvEvent::Put { key: k.as_bytes().to_vec(), value: v.as_bytes().to_vec() }
+}
+fn quiet() -> Options {
+    Options { snapshot_every: 0, ..Options::default() }
+}
+fn start(path: &Path, opts: Options) -> Server<Kv> {
+    Server::<Kv>::start(path, opts).unwrap().0
+}
+struct Watchdog {
+    _cancel: mpsc::Sender<()>,
+}
+fn watchdog() -> Watchdog {
+    const LIMIT: Duration = Duration::from_secs(30);
+    let (tx, rx) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        if rx.recv_timeout(LIMIT) == Err(mpsc::RecvTimeoutError::Timeout) {
+            let _ = writeln!(std::io::stderr(), "\ntest bloqué depuis plus de {LIMIT:?} (réveil perdu ?) : abandon");
+            std::process::exit(101);
+        }
+    });
+    Watchdog { _cancel: tx }
+}
+#[derive(Default, Serialize, Deserialize)]
+struct Counter {
+    n: u64,
+    _pin: PhantomData<*const ()>,
+}
+impl StateMachine for Counter {
+    type Event = u64;
+    fn genesis() -> Self {
+        Self::default()
+    }
+    fn apply(&mut self, by: &u64) {
+        assert_ne!(*by, 13, "événement empoisonné");
+        self.n += by;
+    }
+}
+fn assert_send_sync<T: Send + Sync + 'static>() {}
+#[test]
+fn queued_writes_share_a_single_msync() {
+    const N: u64 = 200;
+    let _wd = watchdog();
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(&dir.path().join("kv.log"), quiet());
+    let h = server.handle();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (gate_tx, gate_rx) = mpsc::channel::<()>();
+    let gate = h.read(move |_| {
+        let _ = entered_tx.send(());
+        let _ = gate_rx.recv(); 
+    });
+    entered_rx.recv().unwrap(); 
+    let writes: Vec<_> = (0..N).map(|i| h.submit(&put(&format!("k{i}"), "v"))).collect();
+    assert_eq!(h.stats().syncs, 0); 
+    gate_tx.send(()).unwrap();
+    gate.wait().unwrap();
+    for (i, write) in writes.into_iter().enumerate() {
+        assert_eq!(write.wait().unwrap(), i as u64 + 1);
+    }
+    let stats = h.stats();
+    assert_eq!(stats.syncs, 1, "{N} écritures, un seul msync");
+    assert_eq!(stats.durable_seq, N);
+    server.shutdown().unwrap();
+}
+#[test]
+fn reads_follow_writes_and_are_answered_only_once_durable() {
+    let _wd = watchdog();
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(&dir.path().join("kv.log"), quiet());
+    let h = server.handle();
+    let write = h.submit(&put("a", "1"));
+    let read = h.read(|kv| kv.get(b"a").map(<[u8]>::to_vec));
+    assert_eq!(read.wait().unwrap(), Some(b"1".to_vec()));
+    assert_eq!(h.stats().durable_seq, 1);
+    assert_eq!(write.wait().unwrap(), 1);
+    let syncs = h.stats().syncs;
+    assert_eq!(h.read(|kv| kv.len()).wait().unwrap(), 1);
+    assert_eq!(h.stats().syncs, syncs);
+    server.shutdown().unwrap();
+}
+#[test]
+fn concurrent_clients_get_unique_consecutive_cycles() {
+    const CLIENTS: u64 = 8;
+    const EACH: u64 = 50;
+    let _wd = watchdog();
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(&dir.path().join("kv.log"), quiet());
+    let h = server.handle();
+    let workers: Vec<_> = (0..CLIENTS)
+        .map(|c| {
+            let h = h.clone();
+            thread::spawn(move || {
+                (0..EACH)
+                    .map(|i| h.submit(&put(&format!("c{c}-{i}"), "v")).wait().unwrap())
+                    .collect::<Vec<u64>>()
+            })
+        })
+        .collect();
+    let mut all = Vec::new();
+    for worker in workers {
+        let seqs = worker.join().unwrap();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "cycles croissants pour un même client");
+        all.extend(seqs);
+    }
+    all.sort_unstable();
+    assert_eq!(all, (1..=CLIENTS * EACH).collect::<Vec<u64>>()); 
+    assert_eq!(h.read(|kv| kv.len()).wait().unwrap() as u64, CLIENTS * EACH);
+    assert_eq!(h.stats().durable_seq, CLIENTS * EACH);
+    server.shutdown().unwrap();
+}
+#[test]
+fn tasks_run_on_the_loop_and_await_durability() {
+    let _wd = watchdog();
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(&dir.path().join("kv.log"), quiet());
+    let h = server.handle();
+    let (done_tx, done_rx) = mpsc::channel();
+    h.spawn(move |ctx| async move {
+        let mut acks = Vec::new();
+        for i in 0..5 {
+            let seq = ctx.submit(&put(&format!("t{i}"), "x")).await.unwrap();
+            acks.push((seq, ctx.handle().stats().durable_seq));
+        }
+        let len = ctx.read(|kv| kv.len());
+        let _ = done_tx.send((acks, len));
+    })
+    .unwrap();
+    let (acks, len) = done_rx.recv().unwrap();
+    assert_eq!(len, 5);
+    for (i, (seq, durable)) in acks.into_iter().enumerate() {
+        assert_eq!(seq, i as u64 + 1);
+        assert!(durable >= seq, "cycle {seq} acquitté avant d'être durable");
+    }
+    assert_eq!(h.submit(&put("outside", "y")).wait().unwrap(), 6);
+    server.shutdown().unwrap();
+}
+#[test]
+fn read_at_replays_the_past_without_disturbing_the_present() {
+    let _wd = watchdog();
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(&dir.path().join("kv.log"), quiet());
+    let h = server.handle();
+    h.submit(&put("k", "v1")).wait().unwrap();
+    h.submit(&put("k", "v2")).wait().unwrap();
+    h.submit(&KvEvent::Delete { key: b"k".to_vec() }).wait().unwrap();
+    let at = |seq| h.read_at(seq, |kv| kv.get(b"k").map(<[u8]>::to_vec)).wait();
+    assert_eq!(at(0).unwrap(), None);
+    assert_eq!(at(1).unwrap(), Some(b"v1".to_vec()));
+    assert_eq!(at(2).unwrap(), Some(b"v2".to_vec()));
+    assert_eq!(at(3).unwrap(), None);
+    assert!(matches!(at(4), Err(Error::SeqOutOfRange { requested: 4, last: 3 })));
+    assert_eq!(h.submit(&put("k", "v4")).wait().unwrap(), 4);
+    assert_eq!(at(4).unwrap(), Some(b"v4".to_vec()));
+    server.shutdown().unwrap();
+}
+#[test]
+fn shutdown_answers_queued_commands_then_closes_the_handle() {
+    let _wd = watchdog();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kv.log");
+    let server = start(&path, quiet());
+    let h = server.handle();
+    let queued: Vec<_> = (0..10).map(|i| h.submit(&put(&format!("k{i}"), "v"))).collect();
+    server.shutdown().unwrap(); 
+    for (i, pending) in queued.into_iter().enumerate() {
+        assert_eq!(pending.wait().unwrap(), i as u64 + 1);
+    }
+    assert!(matches!(h.submit(&put("late", "x")).wait(), Err(Error::Closed)));
+    assert!(matches!(h.read(|kv| kv.len()).wait(), Err(Error::Closed)));
+    assert!(matches!(h.spawn(|_| async {}), Err(Error::Closed)));
+    let (db, rec) = Engine::<Kv>::open(&path).unwrap();
+    assert_eq!((rec.frames, db.last_seq(), db.boot_seq()), (10, 10, 10));
+    assert_eq!(db.state().len(), 10);
+}
+#[test]
+fn restart_recovers_acknowledged_writes_and_snapshots_run_on_the_loop() {
+    let _wd = watchdog();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kv.log");
+    let opts = Options { snapshot_every: 20, ..Options::default() };
+    let (server, rec) = Server::<Kv>::start(&path, opts.clone()).unwrap();
+    assert_eq!(rec.frames, 0);
+    let h = server.handle();
+    for i in 0..50 {
+        h.submit(&put(&format!("k{}", i % 10), &i.to_string())).wait().unwrap();
+    }
+    server.shutdown().unwrap();
+    {
+        let (db, _) = Engine::<Kv>::open(&path).unwrap();
+        assert_eq!(db.snapshots().to_vec(), vec![20, 40, 50]);
+    }
+    let (server, rec) = Server::<Kv>::start(&path, opts).unwrap();
+    assert_eq!(rec.frames, 50);
+    let h = server.handle();
+    let last = h.read(|kv| kv.get(b"k9").map(<[u8]>::to_vec)).wait().unwrap();
+    assert_eq!(last, Some(b"49".to_vec()));
+    assert_eq!(h.submit(&put("next", "1")).wait().unwrap(), 51);
+    server.shutdown().unwrap();
+}
+#[test]
+fn a_second_server_on_the_same_journal_is_refused_until_shutdown() {
+    let _wd = watchdog();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kv.log");
+    let (first, _) = Server::<Kv>::start(&path, quiet()).unwrap();
+    assert!(matches!(Server::<Kv>::start(&path, quiet()), Err(Error::Locked)));
+    first.shutdown().unwrap();
+    assert!(Server::<Kv>::start(&path, quiet()).is_ok());
+}
+#[test]
+fn block_on_composes_pending_futures() {
+    let _wd = watchdog();
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(&dir.path().join("kv.log"), quiet());
+    let h = server.handle();
+    let (a, b, len) = block_on(async {
+        let a = h.submit(&put("a", "1")).await?;
+        let b = h.submit(&put("b", "2")).await?;
+        let len = h.read(|kv| kv.len()).await?;
+        Ok::<_, Error>((a, b, len))
+    })
+    .unwrap();
+    assert_eq!((a, b, len), (1, 2, 2));
+    let (c, d) = block_on(async {
+        let (c, d) = (h.submit(&put("c", "3")), h.submit(&put("d", "4")));
+        Ok::<_, Error>((c.await?, d.await?))
+    })
+    .unwrap();
+    assert_eq!((c, d), (3, 4));
+    server.shutdown().unwrap();
+}
+#[test]
+fn the_state_never_has_to_be_send() {
+    assert_send_sync::<Handle<Counter>>(); 
+    let _wd = watchdog();
+    let dir = tempfile::tempdir().unwrap();
+    let (server, _) = Server::<Counter>::start(dir.path().join("c.log"), quiet()).unwrap();
+    let h = server.handle();
+    assert_eq!(h.submit(&5).wait().unwrap(), 1);
+    assert_eq!(h.submit(&7).wait().unwrap(), 2);
+    assert_eq!(h.read(|c| c.n).wait().unwrap(), 12);
+    server.shutdown().unwrap();
+}
+#[test]
+fn a_panicking_apply_closes_the_loop_instead_of_hanging_clients() {
+    let _wd = watchdog();
+    let dir = tempfile::tempdir().unwrap();
+    let (server, _) = Server::<Counter>::start(dir.path().join("c.log"), quiet()).unwrap();
+    let h = server.handle();
+    assert_eq!(h.submit(&1).wait().unwrap(), 1);
+    assert!(matches!(h.submit(&13).wait(), Err(Error::Closed)));
+    assert!(matches!(h.submit(&2).wait(), Err(Error::Closed)));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| server.shutdown()));
+    assert!(outcome.is_err());
+}
+#[test]
+fn malformed_events_never_reach_the_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut db, _) = Engine::<Kv>::open(dir.path().join("kv.log")).unwrap();
+    let good = postcard::to_allocvec(&put("a", "1")).unwrap();
+    let mut padded = good.clone();
+    padded.push(0);
+    assert!(matches!(db.submit_encoded(&padded), Err(Error::TrailingBytes)));
+    assert!(db.submit_encoded(&[0xFF, 0xFF, 0xFF]).is_err());
+    assert_eq!(db.last_seq(), 0); 
+    assert_eq!(db.submit_encoded(&good).unwrap(), 1);
+    assert_eq!(db.state().get(b"a"), Some(&b"1"[..]));
+}
+
+
+
+========================================
+File: ./tests/snapshot.rs
+========================================
+use std::ops::Range;
+use std::path::Path;
+use chronicle::kv::{Kv, KvEvent};
+use chronicle::{Engine, Options, StateMachine};
+fn event(i: u32) -> KvEvent {
+    let key = format!("k{}", i % 13).into_bytes();
+    if i % 5 == 4 {
+        KvEvent::Delete { key }
+    } else {
+        KvEvent::Put { key, value: format!("v{i}").into_bytes() }
+    }
+}
+fn snap(every: u64) -> Options {
+    Options { snapshot_every: every, keep_recent: 1000, milestone_every: 0, snapshot_dir: None }
+}
+fn build(path: &Path, options: Options, range: Range<u32>, batch: u32) -> Vec<Kv> {
+    let (mut db, _) = Engine::<Kv>::open_with(path, options).unwrap();
+    let mut history = vec![Kv::genesis()];
+    for i in range {
+        db.submit(&event(i)).unwrap();
+        history.push(db.state().clone());
+        if (i + 1) % batch == 0 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    history
+}
+#[test]
+fn restart_uses_latest_snapshot_and_snapshots_are_only_a_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kv.log");
+    let history = build(&path, snap(100), 0..250, 50);
+    let (db, _) = Engine::<Kv>::open_with(&path, snap(100)).unwrap();
+    assert_eq!(db.snapshots().to_vec(), vec![100, 200]);
+    assert_eq!(db.boot_seq(), 200);
+    assert_eq!(db.state(), &history[250]);
+    drop(db);
+    std::fs::remove_dir_all(dir.path().join("kv.log.snapshots")).unwrap();
+    let (db, _) = Engine::<Kv>::open_with(&path, snap(100)).unwrap();
+    assert_eq!(db.boot_seq(), 0);
+    assert_eq!(db.state(), &history[250]);
+}
+#[test]
+fn corrupt_snapshot_falls_back_to_an_older_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kv.log");
+    let history = build(&path, snap(100), 0..250, 50);
+    let newest = dir.path().join("kv.log.snapshots").join(format!("{:020}.snap", 200u64));
+    let mut bytes = std::fs::read(&newest).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    std::fs::write(&newest, bytes).unwrap();
+    let (db, _) = Engine::<Kv>::open_with(&path, snap(100)).unwrap();
+    assert_eq!(db.boot_seq(), 100);
+    assert_eq!(db.state(), &history[250]);
+    assert_eq!(db.state_at(150).unwrap(), history[150]);
+}
+#[test]
+fn snapshot_from_another_history_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a.log"), dir.path().join("b.log"));
+    build(&a, snap(100), 0..150, 50); 
+    let history_b = build(&b, snap(0), 1000..1150, 50); 
+    let foreign = Options { snapshot_dir: Some(dir.path().join("a.log.snapshots")), ..snap(0) };
+    let (db, _) = Engine::<Kv>::open_with(&b, foreign).unwrap();
+    assert_eq!(db.boot_seq(), 0); 
+    assert_eq!(db.state(), &history_b[150]);
+}
+#[test]
+fn snapshot_newer_than_journal_is_quarantined() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kv.log");
+    let history = build(&path, snap(100), 0..250, 50); 
+    let tail = {
+        let (db, _) = Engine::<Kv>::open_with(&path, snap(0)).unwrap();
+        db.journal().tail() as usize
+    };
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[tail / 4..].fill(0);
+    std::fs::write(&path, &bytes).unwrap();
+    let (db, rec) = Engine::<Kv>::open_with(&path, snap(100)).unwrap();
+    assert!(rec.frames > 0 && rec.frames < 100);
+    assert_eq!((db.boot_seq(), db.snapshots().len()), (0, 0));
+    assert_eq!(db.state(), &history[rec.frames as usize]);
+    let orphans = std::fs::read_dir(dir.path().join("kv.log.snapshots"))
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "orphan"))
+        .count();
+    assert_eq!(orphans, 2);
+}
+#[test]
+fn time_travel_and_cursor_match_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kv.log");
+    let history = build(&path, snap(40), 0..300, 20);
+    let (db, _) = Engine::<Kv>::open_with(&path, snap(40)).unwrap();
+    assert!(db.boot_seq() > 0);
+    for (cycle, expected) in history.iter().enumerate() {
+        assert_eq!(&db.state_at(cycle as u64).unwrap(), expected, "state_at({cycle})");
+    }
+    let mut cur = db.cursor_at(0).unwrap();
+    assert_eq!(cur.peek().unwrap(), Some(event(0)));
+    while cur.step_forward().unwrap().is_some() {
+        assert_eq!(cur.state(), &history[cur.seq() as usize]);
+    }
+    assert!(cur.at_end());
+    while let Some(undone) = cur.step_back().unwrap() {
+        assert_eq!(cur.state(), &history[cur.seq() as usize]);
+        assert_eq!(undone, event(cur.seq() as u32)); 
+    }
+    assert_eq!(cur.seq(), 0);
+    cur.goto(250).unwrap();
+    assert_eq!(cur.state(), &history[250]);
+    cur.goto(123).unwrap();
+    assert_eq!(cur.state(), &history[123]);
+    assert!(cur.goto(301).is_err());
+    cur.goto(0).unwrap();
+    let first = history.iter().position(|s| s.len() >= 8).map(|c| c as u64);
+    assert!(first.is_some());
+    assert_eq!(cur.run_until(|s, _| s.len() >= 8).unwrap(), first);
+}
+#[test]
+fn retention_keeps_recent_and_milestones() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kv.log");
+    let policy = Options { snapshot_every: 10, keep_recent: 2, milestone_every: 100, snapshot_dir: None };
+    build(&path, policy.clone(), 0..400, 10);
+    let (db, _) = Engine::<Kv>::open_with(&path, policy).unwrap();
+    assert_eq!(db.snapshots().to_vec(), vec![10, 100, 200, 300, 390, 400]);
+}
+
+
+
