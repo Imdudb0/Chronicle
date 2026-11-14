@@ -28,7 +28,8 @@ jobs:
       - name: Run Chronicle application
         #run: RUST_BACKTRACE=full cargo run --release -- train --out out/m1.bin --secs 1800
         run: |
-          cargo run --release -- cmp --a out/t4.bin --b out/t5.bin --axis depth --n 2000 --esecs 300
+          cargo run --release -- train --init out/t4.bin --out out/t6a.bin --kmax 2 --trunc --qhi 8 \
+      --lr 4e-4 --peakdecay 0.9 --maxcyc 8 --cycle 6000
         env:
           RUSTFLAGS: "-C target-cpu=native"
 
