@@ -5,6 +5,7 @@ mod eval;
 mod train;
 mod diag;
 mod sizes;
+mod tape;
 
 use meta::*;
 use rng::Rng;
@@ -114,8 +115,8 @@ fn ecfg(a: &[String]) -> eval::ECfg {
     }
 }
 
-fn load_or_exit(path: &str) -> net::Net {
-    match net::Net::load(path) {
+fn load_or_exit(path: &str) -> tape::Net {
+    match tape::Net::load(path) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("{} : {}", path, e);
@@ -256,6 +257,11 @@ fn main() {
         Some("diag") => cmd_diag(&args[2..]),
         Some("cmp") => cmd_cmp(&args[2..]),
         Some("sizes") => cmd_sizes(&args[2..]),
+        Some("tgrad") => {
+            if !tape::gradcheck(arg(&args, 2, 1u64)) {
+                std::process::exit(1);
+            }
+        }
         _ => eprintln!(
             "usage : selftest | monde [seed] [n] | gradcheck [seed] | overfit [seed] | check | train [--opts] | eval [--opts] | diag [--opts] | cmp [--opts] | sizes [--opts]"
         ),
