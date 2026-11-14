@@ -6,6 +6,7 @@ mod train;
 mod diag;
 mod sizes;
 mod tape;
+mod probe;
 
 use meta::*;
 use rng::Rng;
@@ -172,6 +173,7 @@ fn ref_prior(a: &[String], path: &str) -> Prior {
     p.t_hi = opt(a, "--thi", p.t_hi);
     p.q_hi = opt(a, "--qhi", p.q_hi);
     p.k_max = opt(a, "--kmax", p.k_max).clamp(1, K_MAX);
+    p.pool = opt(a, "--pool", p.pool).clamp(K_MAX, 256);
     p
 }
 
@@ -203,6 +205,8 @@ fn cmd_train(a: &[String]) {
         n_gate: opt(a, "--ngate", 3000usize),
         secs: opt(a, "--secs", 0.0f64),
         from: opt(a, "--from", 1usize).saturating_sub(1),
+        kmin: opt(a, "--kmin", 1usize).clamp(1, K_MAX),
+        pool: opt(a, "--pool", 26usize).clamp(K_MAX, 256),
         kmax: opt(a, "--kmax", d.k_max).clamp(1, K_MAX),
         fixed,
         out: opt(a, "--out", "m0d.bin".to_string()),
@@ -282,8 +286,50 @@ fn cmd_sizes(a: &[String]) {
     sizes::run(&net, &pr, opt(a, "--qtrain", q), opt(a, "--n", 6000usize), opt(a, "--eseed", 9001u64));
 }
 
+fn wide_prior(a: &[String], path: &str) -> (Prior, usize) {
+    let d = Prior::demo();
+    let (t, q, k) = train::load_ref(path).unwrap_or((d.t_hi, d.q_hi, d.k_max));
+    let mut pr = d;
+    pr.t_hi = opt(a, "--thi", t.max(24));
+    pr.k_max = opt(a, "--kmax", k).clamp(1, K_MAX);
+    pr.q_hi = opt(a, "--qhi", 4 * q);
+    pr.pool = opt(a, "--pool", pr.pool).clamp(K_MAX, 256);
+    (pr, opt(a, "--qtrain", q))
+}
+fn cmd_equiv(a: &[String]) {
+    let path: String = opt(a, "--model", "out/t4.bin".to_string());
+    let net = load_or_exit(&path);
+    let pr = ref_prior(a, &path);
+    probe::equiv(&net, &pr, opt(a, "--n", 3000usize), opt(a, "--eseed", 9001u64));
+}
+fn cmd_hazard(a: &[String]) {
+    let path: String = opt(a, "--model", "out/t4.bin".to_string());
+    let net = load_or_exit(&path);
+    let (pr, q) = wide_prior(a, &path);
+    probe::hazard(&net, &pr, q, opt(a, "--n", 20000usize), opt(a, "--eseed", 9001u64));
+}
+fn cmd_reads(a: &[String]) {
+    let path: String = opt(a, "--model", "out/t4.bin".to_string());
+    let mut net = load_or_exit(&path);
+    let (pr, q) = wide_prior(a, &path);
+    let taus = [1.0, 2.0, 4.0, 8.0, 16.0]; // la base (τ = 1) doit venir en premier
+    probe::reads(&mut net, &pr, q, &taus, opt(a, "--n", 6000usize), opt(a, "--eseed", 9001u64));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let flag = |k: &str| args.windows(2).find(|w| w[0] == k).map(|w| w[1].clone());
+    match flag("--split").as_deref() {
+        Some("canon") => eval::set_split(true),
+        Some("legacy") => eval::set_split(false),
+        _ => {
+            if let Some(p) = flag("--model").or(flag("--a")).or(flag("--init")) {
+                if let Some(c) = train::load_split(&p) {
+                    eval::set_split(c);
+                }
+            }
+        }
+    }
     match args.get(1).map(|s| s.as_str()) {
         Some("selftest") => selftest(),
         Some("monde") => monde(&args[2..]),
@@ -305,6 +351,10 @@ fn main() {
             }
         },
         Some("tcheck") => selftest_trunc(),
+        Some("pcheck") => probe::selfcheck(),
+        Some("equiv") => cmd_equiv(&args[2..]),
+        Some("hazard") => cmd_hazard(&args[2..]),
+        Some("reads") => cmd_reads(&args[2..]),
         _ => eprintln!(
             "usage : selftest | monde [seed] [n] | gradcheck [seed] | overfit [seed] | check | train [--opts] | eval [--opts] | diag [--opts] | cmp [--opts] | sizes [--opts]"
         ),
