@@ -202,7 +202,6 @@ pub struct Net {
     pub rho: f64,
     pub tau: f64,   // température de l'attention de lecture (1.0 = comportement actuel)
     pub hard: bool, // sonde : attention forcée sur la cellule m·k (inférence seulement)
- }
 }
 
 impl Net {
