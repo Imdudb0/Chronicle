@@ -119,6 +119,8 @@ pub struct Work {
     ds: Vec<f64>,
     dsn: Vec<f64>,
     dl: Vec<f64>,
+    pub ticks: usize,  // ticks rétrogrades examinés par le plafond de gain (entraînement)
+    pub capped: usize, // dont ticks rognés
 }
 
 fn grow(v: &mut Vec<f64>, len: usize) {
@@ -145,6 +147,8 @@ impl Work {
             ds: Vec::new(),
             dsn: Vec::new(),
             dl: Vec::new(),
+            ticks: 0, 
+            capped: 0,
         }
     }
 
@@ -187,6 +191,7 @@ fn fill(rng: &mut Rng, v: &mut [f64], sd: f64) {
 pub struct Net {
     pub lay: Lay,
     pub p: Vec<f64>,
+    pub rho: f64,
 }
 
 impl Net {
@@ -214,7 +219,7 @@ impl Net {
         fill(rng, &mut p[l.gw..l.gw + DW * Z_DIM], 0.15);
         fill(rng, &mut p[l.wo..l.wo + NOUT * DR], 0.03);
         fill(rng, &mut p[l.vo..l.vo + NOUT * DW], 0.03);
-        Net { lay, p }
+        Net { lay, p, rho: f64::INFINITY }
     }
 
     /// t ticks à partir de z (= C,V encodés). Sorties : ws.y[k*NOUT..].
@@ -385,6 +390,22 @@ impl Net {
                             }
                         }
                     }
+                }
+            }
+            // plafond de gain rétrograde (entraînement seulement) : la part récurrente de dL/ds[k]
+            // (seule présente dans ws.ds à ce stade) ne dépasse pas rho × ‖dL/ds[k+1]‖ ;
+            // les contributions directes du tick k s'ajoutent ensuite, sans plafond.
+            if k + 1 < t && self.rho.is_finite() {
+                let nn = n * DC;
+                let nr = ws.dsn[..nn].iter().map(|x| x * x).sum::<f64>().sqrt();
+                let nc = ws.ds[..nn].iter().map(|x| x * x).sum::<f64>().sqrt();
+                ws.ticks += 1;
+                if nc > self.rho * nr {
+                    let sc = self.rho * nr / nc;
+                    for x in ws.ds[..nn].iter_mut() {
+                        *x *= sc;
+                    }
+                    ws.capped += 1;
                 }
             }
             // 2. portes G_o = Γ_o W + γ_o
