@@ -9,7 +9,8 @@
 // • Axe profondeur : prior étendu, qmax ∈ [lo, m·q_hi], T dans la plage d'entraînement.
 #![allow(dead_code)]
 
-use crate::meta::{emit_of, mutate_sample, run, sample_world, Prior, Program, Sample};
+use crate::meta::{canon, emit_of, mutate_sample, run, sample_world, Prior, Program, Sample};
+use std::sync::atomic::{AtomicBool, Ordering};
 use crate::tape::{Net, Stat, Work};
 use crate::rng::Rng;
 use std::time::Instant;
@@ -25,7 +26,7 @@ pub enum Part {
 }
 
 /// FNV-1a sur la représentation du programme, puis mélange final (les bits de poids faible servent au split).
-pub fn prog_hash(p: &Program) -> u64 {
+pub fn legacy_hash(p: &Program) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut put = |x: u64| {
         h ^= x;
@@ -49,6 +50,59 @@ pub fn prog_hash(p: &Program) -> u64 {
     h ^= h >> 32;
     h = h.wrapping_mul(0xd6e8_feb8_6659_fd93);
     h ^ (h >> 32)
+}
+
+static SPLIT_CANON: AtomicBool = AtomicBool::new(false);
+pub fn set_split(on: bool) {
+    SPLIT_CANON.store(on, Ordering::Relaxed);
+}
+pub fn split_canon() -> bool {
+    SPLIT_CANON.load(Ordering::Relaxed)
+}
+pub fn prog_hash(p: &Program) -> u64 {
+    if split_canon() { canon_hash(p) } else { legacy_hash(p) }
+}
+fn mix(h: &mut u64, x: u64) {
+    *h ^= x;
+    *h = (*h).wrapping_mul(0x0000_0100_0000_01b3);
+}
+/// Hash du MÉCANISME : symboles renumérotés canoniquement, règles inatteignables écartées, octets exclus.
+pub fn canon_hash(p: &Program) -> u64 {
+    let (ord, new_of) = canon(p);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    mix(&mut h, p.m as u64);
+    mix(&mut h, 0x100 + ord.len() as u64);
+    for &j in &p.q0 {
+        mix(&mut h, new_of[j as usize] as u64);
+    }
+    mix(&mut h, 0x300);
+    for &old in &ord {
+        mix(&mut h, 0x200);
+        for &x in &p.prod[old as usize] {
+            mix(&mut h, new_of[x as usize] as u64);
+        }
+    }
+    h ^= h >> 32;
+    h = h.wrapping_mul(0xd6e8_feb8_6659_fd93);
+    h ^ (h >> 32)
+}
+/// Même vue et même horizon, autre programme (réécriture neutre).
+pub fn with_prog(s: &Sample, np: Program) -> Option<Sample> {
+    let r = run(&np, s.t)?;
+    let emit = emit_of(&np, &r.trace);
+    Some(Sample {
+        prog: np,
+        view: s.view,
+        t: s.t,
+        trace: r.trace,
+        emit,
+        flag: s.flag.clone(),
+        qmax: r.qmax,
+        bits_p: s.bits_p,
+        bits_v: s.bits_v,
+        bits_t: s.bits_t,
+        attempts: s.attempts,
+    })
 }
 
 pub fn in_part(p: &Program, part: Part) -> bool {
@@ -452,7 +506,7 @@ pub fn report(net: &Net, ec: &ECfg, pr: &Prior) -> Verdict {
             judge(&ad[0].2, &ad[1].2, 0.0).name()
         );
     }
-    
+
     println!("{}", v.advice());
     v
 }
