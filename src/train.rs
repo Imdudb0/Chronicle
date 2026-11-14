@@ -32,6 +32,8 @@ pub struct Cfg {
     pub kmax: usize,       // alphabet max des causes
     pub kmin: usize,
     pub pool: usize,
+    pub qtop: usize,
+    pub frontier: bool,
     pub trunc: bool,       // troncature de l'horizon au lieu du rejet par qmax
     pub fixed: Option<(usize, usize)>, // plage fixe (t_hi, q_hi) : un seul étage, sans curriculum
     pub out: String,
@@ -133,6 +135,7 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
     fin.k_max = cfg.kmax;
     fin.k_min = cfg.kmin;
     fin.pool = cfg.pool;
+    fin.q_hi = cfg.qtop;
     fin.trunc = cfg.trunc;
     let sts: Vec<Prior> = match cfg.fixed {
         Some((t, q)) => {
@@ -275,7 +278,11 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
         let cyc_end = k >= cycle;
         if step % every == 0 || cyc_end || timeout {
             let nv = if cyc_end { cfg.n_gate } else { cfg.n_val };
-            let v = validate(&net, pr, nv, &mut vrng, &mut vws);
+            let v = if cyc_end && cfg.frontier {
+                validate(&net, &frontier_of(pr), nv, &mut vrng, &mut vws)
+            } else {
+                validate(&net, pr, nv, &mut vrng, &mut vws)
+            };
             let el = clock.elapsed().as_secs_f64();
             let tot_q = gq.iter().sum::<f64>().max(1e-300);
             let mut ord: Vec<usize> = (0..groups.len()).collect();
@@ -328,7 +335,8 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
                         break;
                     }
                     // extrapolation d'un étage : poids de fin d'étage sur la plage suivante, avant toute mise à jour
-                    let zs = validate(&net, &sts[stage + 1], cfg.n_gate, &mut vrng, &mut vws);
+                    let zp = if cfg.frontier { frontier_of(&sts[stage + 1]) } else { sts[stage + 1].clone() };
+                    let zs = validate(&net, &zp, cfg.n_gate, &mut vrng, &mut vws);
                     println!(
                         "  ↑ porte franchie ({:.1}% ≥ {:.0}%) → étage {}/{} : T ≤ {}, qmax ≤ {}",
                         100.0 * v.fid(),
@@ -386,4 +394,12 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
     );
     let p = sts[last_stage].clone();
     (net, p)
+}
+
+/// Bin de frontière : mondes complets (sans troncature) dont la file atteint q−1 ou q.
+fn frontier_of(p: &Prior) -> Prior {
+    let mut f = p.clone();
+    f.trunc = false;
+    f.q_lo = p.q_hi.saturating_sub(1).max(1);
+    f
 }
