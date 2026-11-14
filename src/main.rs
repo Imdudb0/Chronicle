@@ -77,6 +77,42 @@ fn selftest() {
     println!("ok 5 : déterminisme\nSELFTEST OK");
 }
 
+fn selftest_trunc() {
+    let (a, b) = (b'a', b'b');
+    // 1. a→aab depuis q0 = a : files lues 1, 3, 5, 7 ; avec cap 6, on garde les ticks 0..2
+    let g = Program { m: 1, bytes: vec![a, b], prod: vec![vec![0, 0, 1], vec![]], q0: vec![0] };
+    assert_eq!(sizes::queue_lens(&g, 4), vec![1, 3, 5, 7]);
+    assert_eq!(run_cap(&g, 10, 6).unwrap().trace, vec![0, 0, 0]);
+    // 2. sans dépassement, run_cap = run
+    let rep = Program { m: 1, bytes: vec![a, b], prod: vec![vec![0], vec![1]], q0: vec![0, 1] };
+    assert_eq!(run_cap(&rep, 9, 6).unwrap().trace, run(&rep, 9).unwrap().trace);
+    // 3. file épuisée : None, comme run
+    let dead = Program { m: 1, bytes: vec![a], prod: vec![vec![]], q0: vec![0] };
+    assert!(run_cap(&dead, 2, 6).is_none());
+    println!("ok 1 : run_cap");
+    // 4. mondes tronqués et enfants mutés : invariants
+    let mut pr = Prior::demo();
+    pr.trunc = true;
+    pr.q_hi = 3;
+    let mut rng = Rng::new(11);
+    let mut tot_att = 0u64;
+    let n = 3000;
+    for _ in 0..n {
+        let s = sample_world(&mut rng, &pr, 100_000).expect("monde");
+        tot_att += s.attempts as u64;
+        assert!(s.t >= 1 && s.t > s.view.o && s.flag.iter().any(|&f| f));
+        assert_eq!(run(&s.prog, s.t).unwrap().trace, s.trace);
+        assert!(sizes::queue_lens(&s.prog, s.t).iter().all(|&l| l <= pr.q_hi));
+        if let Some(c) = mutate_sample(&mut rng, &s, &pr, 200) {
+            assert!(c.t >= 1 && c.t > c.view.o && c.t <= s.t);
+            assert_eq!(run(&c.prog, c.t).unwrap().trace, c.trace);
+            assert!(sizes::queue_lens(&c.prog, c.t).iter().all(|&l| l <= pr.q_hi));
+        }
+    }
+    println!("ok 2 : {} mondes tronqués (q ≤ {}), tentatives moyennes {:.2}", n, pr.q_hi, tot_att as f64 / n as f64);
+    println!("TCHECK OK");
+}
+
 fn monde(args: &[String]) {
     let seed: u64 = args.get(0).and_then(|s| s.parse().ok()).unwrap_or(1);
     let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(8);
@@ -174,10 +210,13 @@ fn cmd_train(a: &[String]) {
         lr_stage: opt(a, "--lrstage", 5e-4f64),
         warm: opt(a, "--warm", 300usize),
         rho: opt(a, "--rho", 1.2f64),
+        trunc: a.iter().any(|x| x.as_str() == "--trunc"),
     };
     let (net, pr) = train::train(&cfg);
     println!("modèle : {} (plage : T ≤ {}, qmax ≤ {}, k ≤ {})\n", cfg.out, pr.t_hi, pr.q_hi, pr.k_max);
-    let v = eval::report(&net, &ecfg(a), &pr);
+    let mut ev = pr.clone();
+    ev.trunc = false; // l'évaluation tire toujours des mondes complets
+    let v = eval::report(&net, &ecfg(a), &ev);
     std::process::exit(v.code());
 }
 
@@ -264,7 +303,8 @@ fn main() {
             if !tape::gradcheck(arg(&args, 2, 1u64)) {
                 std::process::exit(1);
             }
-        }
+        },
+        Some("tcheck") => selftest_trunc(),
         _ => eprintln!(
             "usage : selftest | monde [seed] [n] | gradcheck [seed] | overfit [seed] | check | train [--opts] | eval [--opts] | diag [--opts] | cmp [--opts] | sizes [--opts]"
         ),
