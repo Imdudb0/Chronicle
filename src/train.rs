@@ -30,6 +30,8 @@ pub struct Cfg {
     pub secs: f64,         // plafond de temps (0 = aucun)
     pub from: usize,       // étage de départ (0-based)
     pub kmax: usize,       // alphabet max des causes
+    pub kmin: usize,
+    pub pool: usize,
     pub trunc: bool,       // troncature de l'horizon au lieu du rejet par qmax
     pub fixed: Option<(usize, usize)>, // plage fixe (t_hi, q_hi) : un seul étage, sans curriculum
     pub out: String,
@@ -54,7 +56,15 @@ pub fn stages(fin: &Prior) -> Vec<Prior> {
 }
 
 pub fn save_ref(path: &str, p: &Prior) {
-    let _ = std::fs::write(format!("{}.ref", path), format!("{} {} {}", p.t_hi, p.q_hi, p.k_max));
+    let _ = std::fs::write(
+        format!("{}.ref", path),
+        format!("{} {} {} {}", p.t_hi, p.q_hi, p.k_max, crate::eval::split_canon() as u8),
+    );
+}
+pub fn load_split(path: &str) -> Option<bool> {
+    let s = std::fs::read_to_string(format!("{}.ref", path)).ok()?;
+    let v = s.split_whitespace().nth(3)?.parse::<u8>().ok()?;
+    Some(v == 1)
 }
 
 /// (t_hi, q_hi, k_max) de la plage d'entraînement du modèle, si le sidecar existe.
@@ -121,6 +131,8 @@ impl Worker {
 pub fn train(cfg: &Cfg) -> (Net, Prior) {
     let mut fin = Prior::demo();
     fin.k_max = cfg.kmax;
+    fin.k_min = cfg.kmin;
+    fin.pool = cfg.pool;
     fin.trunc = cfg.trunc;
     let sts: Vec<Prior> = match cfg.fixed {
         Some((t, q)) => {
@@ -140,6 +152,10 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
                 net = n;
                 println!("poids initiaux : {}", cfg.init);
             }
+            if load_split(&cfg.init).unwrap_or(false) != crate::eval::split_canon() {
+                    eprintln!("attention : --init vient d'un autre split ; les mondes « non vus » de l'un ont servi à entraîner l'autre");
+                }
+             }
             Err(e) => {
                 eprintln!("--init {} : {}", cfg.init, e);
                 std::process::exit(1);
@@ -191,6 +207,7 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
         if cfg.trunc { "troncature (horizon coupé au dernier tick dont la file lue est ≤ q)" } else { "rejet par qmax (v1)" }
     );
     println!("étage {}/{} : T ≤ {}, qmax ≤ {}", stage + 1, nst, sts[stage].t_hi, sts[stage].q_hi);
+    println!("k ∈ [{}, {}] | alphabet {} octets | split {}", fin.k_min, fin.k_max, fin.pool, if crate::eval::split_canon() { "canonique" } else { "legacy" });
 
     let clock = Instant::now();
     let (mut cyc, mut k, mut step, mut done) = (0usize, 0usize, 0usize, 0usize);
