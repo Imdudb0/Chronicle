@@ -1,0 +1,121 @@
+name: Concatenate .rs files
+
+on:
+  workflow_dispatch:
+    inputs:
+      remove_comments:
+        description: 'Supprimer les commentaires'
+        required: true
+        type: boolean
+        default: true
+      remove_tests:
+        description: 'Supprimer les modules de tests (#[cfg(test)])'
+        required: true
+        type: boolean
+        default: true
+      output_file:
+        description: 'Nom du fichier de sortie'
+        required: true
+        type: string
+        default: 'all_files_concatenated.txt'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  concatenate-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Concatenate all Rust files
+        working-directory: ./
+        env:
+          REMOVE_COMMENTS: ${{ inputs.remove_comments }}
+          REMOVE_TESTS: ${{ inputs.remove_tests }}
+        run: |
+          # Récupérer le nom du fichier de sortie depuis les inputs
+          OUTPUT_FILE="${{ inputs.output_file }}"
+          
+          # Vider le fichier s'il existe déjà
+          > "$OUTPUT_FILE"
+          
+          echo "Options sélectionnées :"
+          echo "  - Supprimer les commentaires : $REMOVE_COMMENTS"
+          echo "  - Supprimer les tests         : $REMOVE_TESTS"
+          echo "  - Fichier de sortie           : $OUTPUT_FILE"
+          echo ""
+          
+          # Construire dynamiquement le script Perl en fonction des options
+          # 1. Toujours protéger les chaînes de caractères (normales et raw strings)
+          # 2. Supprime les commentaires (si activé)
+          # 3. Supprime les blocs #[cfg(test)] mod ... { ... } (si activé)
+          #
+          # Le pattern des chaînes/raw strings est réutilisé comme "capture group"
+          # dans les alternatives pour ne pas les toucher.
+          
+          PERL_SCRIPT='s/(r(#*)"(.*?)"\2)|("[^"\\]*(?:\\.[^"\\]*)*")'
+          if [ "$REMOVE_COMMENTS" = "true" ]; then
+            PERL_SCRIPT="$PERL_SCRIPT"'|\/\*.*?\*\/|\/\/[^\n]*'
+          fi
+          if [ "$REMOVE_TESTS" = "true" ]; then
+            PERL_SCRIPT="$PERL_SCRIPT"'|#\[cfg\(test\)\](?:\s*#\[(?:[^\]"]|"(?:\\.|[^"\\])*")*\])*\s*mod\s+\w+\s*(?:(\{(?:[^{}]++|(?-1))*\})|;)'
+          fi
+          PERL_SCRIPT="$PERL_SCRIPT"'/$1$4/gs'
+          
+          # Parcourir uniquement les fichiers .rs
+          find . -type f -name "*.rs" \
+            ! -path "*/target/*" \
+            ! -path "*/.git/*" \
+            ! -path "*/test/*" \
+            ! -path "*/benches/*" \
+            ! -path "*/examples/*" \
+            ! -path "*/spattiar-ffi/*" \
+            ! -path "*/spattiar-meta/*" \
+            ! -path "*/spattiar-py/*" \
+            ! -path "*/spattiar-core/*" \
+            ! -path "*/spattiar-math/*" \
+            ! -path "*/spattiar-params/*" \
+            | sort | while read file; do
+            echo "========================================" >> "$OUTPUT_FILE"
+            echo "File: $file" >> "$OUTPUT_FILE"
+            echo "========================================" >> "$OUTPUT_FILE"
+            
+            # Appliquer le script Perl dynamique
+            perl -0777 -pe "$PERL_SCRIPT" "$file" \
+            | grep -v '^[[:space:]]*$' >> "$OUTPUT_FILE"
+            
+            echo -e "\n\n" >> "$OUTPUT_FILE"
+          done
+          
+          echo "Concatenation complete. Total Rust files processed:"
+          find . -type f -name "*.rs" \
+            ! -path "*/target/*" \
+            ! -path "*/.git/*" \
+            ! -path "*/test/*" \
+            ! -path "*/benches/*" \
+            ! -path "*/examples/*" \
+            ! -path "*/spattiar-ffi/*" \
+            ! -path "*/spattiar-meta/*" \
+            ! -path "*/spattiar-py/*" \
+            ! -path "*/spattiar-core/*" \
+            ! -path "*/spattiar-math/*" \
+            ! -path "*/spattiar-params/*" \
+            | wc -l
+
+      - name: Commit concatenated file
+        working-directory: ./
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add "${{ inputs.output_file }}"
+          git diff --staged --quiet || git commit -m "Auto-update: Concatenate all Rust (.rs) files (comments: ${{ inputs.remove_comments }}, tests: ${{ inputs.remove_tests }})"
+
+      - name: Push changes
+        uses: ad-m/github-push-action@master
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.ref }}
