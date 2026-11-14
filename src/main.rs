@@ -316,6 +316,13 @@ fn cmd_reads(a: &[String]) {
     probe::reads(&mut net, &pr, q, &taus, opt(a, "--n", 6000usize), opt(a, "--eseed", 9001u64));
 }
 
+fn cmd_frame(a: &[String]) {
+    let path: String = opt(a, "--model", "out/t4.bin".to_string());
+    let net = load_or_exit(&path);
+    let (pr, q) = wide_prior(a, &path);
+    probe::frame(&net, &pr, q, opt(a, "--n", 3000usize), opt(a, "--eseed", 9001u64));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let flag = |k: &str| args.windows(2).find(|w| w[0] == k).map(|w| w[1].clone());
@@ -355,6 +362,7 @@ fn main() {
         Some("equiv") => cmd_equiv(&args[2..]),
         Some("hazard") => cmd_hazard(&args[2..]),
         Some("reads") => cmd_reads(&args[2..]),
+        Some("frame") => cmd_frame(&args[2..]),
         _ => eprintln!(
             "usage : selftest | monde [seed] [n] | gradcheck [seed] | overfit [seed] | check | train [--opts] | eval [--opts] | diag [--opts] | cmp [--opts] | sizes [--opts]"
         ),
