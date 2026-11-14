@@ -57,6 +57,7 @@ pub struct View {
 #[derive(Clone, Debug)]
 pub struct Prior {
     pub pool: usize,              // octets b'a'.. (modulo 256)
+    pub k_min: usize,
     pub k_max: usize,             // alphabet 1..=k_max
     pub q0_max: usize,            // file initiale 1..=q0_max
     pub m2: f64,                  // P(m = 2)
@@ -73,7 +74,7 @@ pub struct Prior {
 impl Prior {
     pub fn demo() -> Prior {
         Prior {
-            pool: 26, k_max: 4, q0_max: 3, m2: 0.3,
+            pool: 26, k_min: 1, k_max: 4, q0_max: 3, m2: 0.3,
             w1: [0.1, 0.6, 0.2, 0.1], w2: [0.1, 0.2, 0.5, 0.2],
             t_lo: 4, t_hi: 16, q_lo: 1, q_hi: 6, need_all_fired: true,
             trunc: false,
@@ -100,8 +101,9 @@ pub struct Sample {
 
 pub fn sample_program(rng: &mut Rng, pr: &Prior, bits: &mut f64) -> Program {
     let k_cap = pr.k_max.min(K_MAX).min(pr.pool);
-    let k = rng.range(1, k_cap);
-    *bits += (k_cap as f64).log2();
+    let k_lo = pr.k_min.clamp(1, k_cap);
+    let k = rng.range(k_lo, k_cap);
+    *bits += ((k_cap - k_lo + 1) as f64).log2();
     let mut pool: Vec<u8> = (0..pr.pool).map(|i| ((b'a' as usize + i) % 256) as u8).collect();
     let mut bytes = Vec::with_capacity(k);
     for _ in 0..k {
@@ -357,4 +359,56 @@ pub fn encode(p: &Program, v: &View, z: &mut [f32]) {
     }
     z[H_DIM + v.s - 1] = 1.0;
     z[H_DIM + 3 + v.o] = 1.0;
+}
+
+// ---- réécritures neutres (interventions nulles) et forme canonique du mécanisme ----
+fn visit(j: u8, new_of: &mut [u8], ord: &mut Vec<u8>) {
+    if new_of[j as usize] == u8::MAX {
+        new_of[j as usize] = ord.len() as u8;
+        ord.push(j);
+    }
+}
+
+/// (ord, new_of) : ord[nouveau] = ancien ; new_of[ancien] = nouveau (u8::MAX : règle inatteignable
+/// depuis q0, qui ne peut jamais changer la trace). Ordre = première apparition (q0, puis productions).
+pub fn canon(p: &Program) -> (Vec<u8>, Vec<u8>) {
+    let mut new_of = vec![u8::MAX; p.k()];
+    let mut ord: Vec<u8> = Vec::with_capacity(p.k());
+    for &j in &p.q0 {
+        visit(j, &mut new_of, &mut ord);
+    }
+    let mut i = 0;
+    while i < ord.len() {
+        let old = ord[i] as usize;
+        for &x in &p.prod[old] {
+            visit(x, &mut new_of, &mut ord);
+        }
+        i += 1;
+    }
+    (ord, new_of)
+}
+
+/// Renomme les règles j -> pi[j]. Même mécanisme, même E ; la trace est relabellisée par pi.
+pub fn rename_idx(p: &Program, pi: &[u8]) -> Program {
+    let k = p.k();
+    let mut bytes = vec![0u8; k];
+    let mut prod: Vec<Vec<u8>> = vec![Vec::new(); k];
+    for j in 0..k {
+        let nj = pi[j] as usize;
+        bytes[nj] = p.bytes[j];
+        prod[nj] = p.prod[j].iter().map(|&x| pi[x as usize]).collect();
+    }
+    let q0 = p.q0.iter().map(|&x| pi[x as usize]).collect();
+    Program { m: p.m, bytes, prod, q0 }
+}
+
+/// Remplace les octets par k valeurs distinctes de `alpha` (alpha.len() ≥ k). Même trace ; E est renommé.
+pub fn rebyte(p: &Program, rng: &mut Rng, alpha: &[u8]) -> Program {
+    let mut pool: Vec<u8> = alpha.to_vec();
+    let mut np = p.clone();
+    for j in 0..p.k() {
+        let i = rng.below(pool.len());
+        np.bytes[j] = pool.swap_remove(i);
+    }
+    np
 }
