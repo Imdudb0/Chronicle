@@ -67,6 +67,7 @@ pub struct Prior {
     pub q_lo: usize,              // filtre : qmax ∈ [q_lo, q_hi]
     pub q_hi: usize,
     pub need_all_fired: bool,     // filtre de minimalité : toute règle tire dans l'horizon
+    pub trunc: bool, // true : horizon coupé au dernier tick dont la file lue est ≤ q_hi, au lieu de rejeter le monde
 }
 
 impl Prior {
@@ -75,6 +76,7 @@ impl Prior {
             pool: 26, k_max: 4, q0_max: 3, m2: 0.3,
             w1: [0.1, 0.6, 0.2, 0.1], w2: [0.1, 0.2, 0.5, 0.2],
             t_lo: 4, t_hi: 16, q_lo: 1, q_hi: 6, need_all_fired: true,
+            trunc: false,
         }
     }
 }
@@ -174,6 +176,36 @@ pub fn run(p: &Program, t: usize) -> Option<Run> {
     Some(Run { trace, qmax, fired })
 }
 
+/// Comme `run`, mais l'horizon est coupé (sans rejet) au premier tick dont la file lue dépasse `cap`.
+/// Ticks gardés = ceux dont la file avant pop est ≤ cap. None si la file s'épuise avant.
+pub fn run_cap(p: &Program, t: usize, cap: usize) -> Option<Run> {
+    let mut q: VecDeque<u8> = p.q0.iter().copied().collect();
+    let mut qmax = q.len();
+    let mut trace = Vec::with_capacity(t);
+    let mut fired: u32 = 0;
+    for _ in 0..t {
+        if q.len() > cap {
+            break;
+        }
+        if q.len() < p.m {
+            return None;
+        }
+        let j = q.pop_front()?;
+        for _ in 1..p.m {
+            let _ = q.pop_front();
+        }
+        trace.push(j);
+        fired |= 1u32 << (j as u32);
+        for &x in &p.prod[j as usize] {
+            q.push_back(x);
+        }
+        if q.len() > qmax {
+            qmax = q.len();
+        }
+    }
+    Some(Run { trace, qmax, fired })
+}
+
 pub fn emit_of(p: &Program, trace: &[u8]) -> Vec<u8> {
     trace.iter().map(|&j| p.bytes[j as usize]).collect()
 }
@@ -185,7 +217,8 @@ fn finish(p: Program, view: View, t: usize, r: Run, bp: f64, bv: f64, bt: f64, a
     Sample { prog: p, view, t, trace: r.trace, emit, flag, qmax: r.qmax, bits_p: bp, bits_v: bv, bits_t: bt, attempts: att }
 }
 
-/// Monde = (C, V, T) tiré du prior, filtré (productif, qmax, minimalité).
+/// Monde = (C, V, T) tiré du prior. Filtres : productif, minimalité (horizon complet) ; puis, selon `trunc`,
+/// rejet par qmax (v1) ou troncature de l'horizon à file ≤ q_hi (v2).
 pub fn sample_world(rng: &mut Rng, pr: &Prior, max_attempts: u32) -> Option<Sample> {
     for a in 1..=max_attempts {
         let (mut bp, mut bv) = (0.0f64, 0.0f64);
@@ -197,10 +230,21 @@ pub fn sample_world(rng: &mut Rng, pr: &Prior, max_attempts: u32) -> Option<Samp
             Some(r) => r,
             None => continue,
         };
-        if r.qmax < pr.q_lo || r.qmax > pr.q_hi {
+        if pr.need_all_fired && r.fired != (1u32 << p.k()) - 1 {
             continue;
         }
-        if pr.need_all_fired && r.fired != (1u32 << p.k()) - 1 {
+        if pr.trunc {
+            let rc = match run_cap(&p, t, pr.q_hi) {
+                Some(rc) => rc,
+                None => continue,
+            };
+            let te = rc.trace.len();
+            if te == 0 || te <= view.o {
+                continue; // aucun tick observé par la vue
+            }
+            return Some(finish(p, view, te, rc, bp, bv, bt, a));
+        }
+        if r.qmax < pr.q_lo || r.qmax > pr.q_hi {
             continue;
         }
         return Some(finish(p, view, t, r, bp, bv, bt, a));
@@ -261,12 +305,21 @@ pub fn mutate(rng: &mut Rng, p: &Program, bits: &mut f64) -> Program {
     np
 }
 
-/// Enfant muté du parent, même vue et même budget. Productif et qmax ≤ q_hi
-/// exigés ; pas de filtre de minimalité (D doit rester total sur les voisins).
+/// Enfant muté du parent, même vue, horizon ≤ celui du parent. Productif exigé ; qmax ≤ q_hi exigé (v1)
+/// ou horizon coupé à file ≤ q_hi (v2). Pas de filtre de minimalité : D doit rester total sur les voisins.
 pub fn mutate_sample(rng: &mut Rng, par: &Sample, pr: &Prior, max_attempts: u32) -> Option<Sample> {
     for a in 1..=max_attempts {
         let mut bp = par.bits_p;
         let np = mutate(rng, &par.prog, &mut bp);
+        if pr.trunc {
+            if let Some(r) = run_cap(&np, par.t, pr.q_hi) {
+                let te = r.trace.len();
+                if te > 0 && te > par.view.o {
+                    return Some(finish(np, par.view, te, r, bp, par.bits_v, par.bits_t, a));
+                }
+            }
+            continue;
+        }
         if let Some(r) = run(&np, par.t) {
             if r.qmax > pr.q_hi {
                 continue;
