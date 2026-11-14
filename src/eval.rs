@@ -11,6 +11,7 @@
 
 use crate::meta::{emit_of, mutate_sample, run, sample_world, Prior, Program, Sample};
 use crate::net::{Net, Stat, Work};
+use crate::tape::{Net, Stat, Work};
 use crate::rng::Rng;
 use std::time::Instant;
 
