@@ -56,6 +56,7 @@ pub fn selfcheck() {
     println!("ok 1 : renommages (règles, octets) : E, trace et forme canonique cohérents sur {} mondes", n);
     println!("ok 2 : une mutation locale change la forme canonique dans {:.1} % des cas", 100.0 * diff as f64 / n as f64);
     assert!(diff * 10 >= n * 8, "le hash canonique sépare trop peu de mécanismes");
+    check_ages();
     println!("PCHECK OK");
 }
 
