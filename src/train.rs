@@ -1,19 +1,24 @@
-// Entraînement de D (v3) : minibatchs parallèles (threads std), Adam, curriculum piloté par la fidélité,
+// Entraînement de D (v4) : minibatchs parallèles (threads std), Adam, curriculum piloté par la fidélité,
 // ou plage fixe (--thi / --qhi) pour le contrôle de plage d'entraînement.
 //
 // • Programmes d'entraînement : jamais le sous-ensemble « non vu » (hash(C) mod 8 = 0), voisins mutés compris.
 // • lr en cycles cosinus dans chaque étage : crête → lr_min ; crête × peak_decay à chaque cycle de plus.
+//   v4 : crête du premier cycle = lr à l'étage de départ, lr_stage aux étages suivants, avec une montée
+//   linéaire de `warm` pas à l'entrée de ces étages.
+// • v4 : plafond de gain rétrograde rho (tape::Net.rho) ; la colonne « plaf » donne la part de ticks rognés.
+// • v4 : à chaque montée d'étage, fid « zéro-coup » des poids de fin d'étage sur la plage suivante.
+// • v4 : énergie du gradient par groupe de paramètres (top 3) dans chaque ligne de suivi.
 // • Porte jugée en fin de cycle (lr minimal) sur n_gate mondes non vus non triviaux : étage intermédiaire,
 //   fid ≥ up → on monte ; étage final, fid ≥ gate → on s'arrête ; max_cycles cycles sans la franchir → arrêt.
 // • --kmax : taille d'alphabet maximale des causes (bouton du prior, au grand livre).
-// • <out>.ref garde la plage d'entraînement « t_hi q_hi k_max » : eval, diag et cmp la lisent par défaut.
+// • <out>.ref garde la plage d'entraînement « t_hi q_hi k_max » : eval, diag, sizes et cmp la lisent par défaut.
 // • Un Rng, un Work et un tampon de gradient par fil ; déterministe pour (seed, nombre de fils).
 #![allow(dead_code)]
 
 use crate::eval::{draw_world, in_part, nontrivial, validate, Agg, Part};
 use crate::meta::{mutate_sample, Prior, Sample};
-use crate::tape::{Adam, Net, Work};
 use crate::rng::Rng;
+use crate::tape::{Adam, Net, Work};
 use std::time::Instant;
 
 pub struct Cfg {
@@ -21,19 +26,22 @@ pub struct Cfg {
     pub steps: usize,
     pub batch: usize,
     pub threads: usize,
-    pub lr: f64,           // crête du premier cycle de chaque étage
+    pub lr: f64,           // crête du premier cycle de l'étage de départ
+    pub lr_stage: f64,     // crête du premier cycle des étages suivants
+    pub warm: usize,       // montée linéaire (pas) à l'entrée des étages suivants
     pub lr_min: f64,       // lr en fin de cycle
     pub cycle: usize,      // pas par cycle
     pub max_cycles: usize, // cycles max par étage
     pub peak_decay: f64,   // crête × peak_decay à chaque cycle de plus dans un même étage
     pub clip: f64,
+    pub rho: f64,          // plafond de gain rétrograde (∞ = aucun)
     pub w_trace: f64,
     pub mut_frac: f64,
     pub up: f64,           // porte des étages intermédiaires
     pub gate: f64,         // porte de l'étage final
     pub every: usize,      // pas entre deux validations de suivi
     pub n_val: usize,
-    pub n_gate: usize,     // taille de la validation de porte
+    pub n_gate: usize,     // taille de la validation de porte et du zéro-coup
     pub secs: f64,         // plafond de temps (0 = aucun)
     pub from: usize,       // étage de départ (0-based)
     pub kmax: usize,       // alphabet max des causes
@@ -109,6 +117,8 @@ impl Worker {
         for x in self.g.iter_mut() {
             *x = 0.0;
         }
+        self.ws.ticks = 0;
+        self.ws.capped = 0;
         let mut a = Agg::default();
         for _ in 0..n {
             let s = draw_train(&mut self.rng, pr, mut_frac);
@@ -149,6 +159,7 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
             }
         }
     }
+    net.rho = cfg.rho;
     let np = net.p.len();
     let nth = cfg.threads.clamp(1, cfg.batch.max(1));
     let mut workers: Vec<Worker> = (0..nth).map(|_| Worker::new(rng.fork(), np)).collect();
@@ -156,11 +167,15 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
     let mut vws = Work::new();
     let mut adam = Adam::new(np);
     let mut g = vec![0.0f64; np];
+    let groups = net.lay.groups();
+    let mut gq = vec![0.0f64; groups.len()];
+    let (mut cap_t, mut cap_c) = (0usize, 0usize);
     let cycle = cfg.cycle.max(1);
     let every = cfg.every.max(1);
     let mut stage = cfg.from.min(nst - 1);
+    let stage0 = stage;
     println!(
-        "entraînement de D (v3) : {} paramètres, {} fil(s), lot {}, {} étage(s){}, départ étage {}, k ≤ {}, mutés {:.2}",
+        "entraînement de D (v4) : {} paramètres, {} fil(s), lot {}, {} étage(s){}, départ étage {}, k ≤ {}, mutés {:.2}",
         np,
         nth,
         cfg.batch,
@@ -171,8 +186,18 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
         cfg.mut_frac
     );
     println!(
-        "lr {:.1e} → {:.1e} par cycle de {} pas (crête ×{:.2} par cycle de plus), ≤ {} cycles/étage ; portes : up {:.0}% / final {:.0}% (fid sur mondes non triviaux non vus, n = {})",
-        cfg.lr, cfg.lr_min, cycle, cfg.peak_decay, cfg.max_cycles, 100.0 * cfg.up, 100.0 * cfg.gate, cfg.n_gate
+        "lr {:.1e} (étages suivants {:.1e}, montée {} pas) → {:.1e} par cycle de {} pas (crête ×{:.2} par cycle de plus), ≤ {} cycles/étage ; plafond de gain rétrograde ρ = {} ; portes : up {:.0}% / final {:.0}% (n = {})",
+        cfg.lr,
+        cfg.lr_stage,
+        cfg.warm,
+        cfg.lr_min,
+        cycle,
+        cfg.peak_decay,
+        cfg.max_cycles,
+        cfg.rho,
+        100.0 * cfg.up,
+        100.0 * cfg.gate,
+        cfg.n_gate
     );
     println!("étage {}/{} : T ≤ {}, qmax ≤ {}", stage + 1, nst, sts[stage].t_hi, sts[stage].q_hi);
 
@@ -186,9 +211,13 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
     while step < cfg.steps {
         let pr = &sts[stage];
         last_stage = stage;
-        let peak = (cfg.lr * cfg.peak_decay.powi(cyc as i32)).max(cfg.lr_min);
-        let lr = cfg.lr_min
+        let first = if stage > stage0 { cfg.lr_stage } else { cfg.lr };
+        let peak = (first * cfg.peak_decay.powi(cyc as i32)).max(cfg.lr_min);
+        let mut lr = cfg.lr_min
             + 0.5 * (peak - cfg.lr_min) * (1.0 + (std::f64::consts::PI * k as f64 / cycle as f64).cos());
+        if stage > stage0 && cyc == 0 && k < cfg.warm {
+            lr *= (k + 1) as f64 / cfg.warm as f64;
+        }
 
         let (base, extra) = (cfg.batch / nth, cfg.batch % nth);
         let mut aggs: Vec<Agg> = Vec::with_capacity(nth);
@@ -211,10 +240,15 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
             for (a, b) in g.iter_mut().zip(&w.g) {
                 *a += *b;
             }
+            cap_t += w.ws.ticks;
+            cap_c += w.ws.capped;
         }
         let inv = 1.0 / cfg.batch as f64;
         for x in g.iter_mut() {
             *x *= inv;
+        }
+        for (i, &(_, off, len)) in groups.iter().enumerate() {
+            gq[i] += g[off..off + len].iter().map(|x| x * x).sum::<f64>();
         }
         let gn = adam.step(&mut net.p, &g, lr, cfg.clip);
         if gn.is_finite() {
@@ -236,8 +270,16 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
             let nv = if cyc_end { cfg.n_gate } else { cfg.n_val };
             let v = validate(&net, pr, nv, &mut vrng, &mut vws);
             let el = clock.elapsed().as_secs_f64();
+            let tot_q = gq.iter().sum::<f64>().max(1e-300);
+            let mut ord: Vec<usize> = (0..groups.len()).collect();
+            ord.sort_by(|&a, &b| gq[b].total_cmp(&gq[a]));
+            let top: Vec<String> = ord
+                .iter()
+                .take(3)
+                .map(|&i| format!("{} {:.0}%", groups[i].0, 100.0 * gq[i] / tot_q))
+                .collect();
             println!(
-                "pas {:>6}  étage {}/{} (T≤{}, q≤{})  cycle {}/{}  lr {:.1e}  L {:.4}  train {:>5.1}%  val {:>5.1}% ±{:.1}{}  |g| {:.3}  {:.0} éch/s  {:.0} s",
+                "pas {:>6}  étage {}/{} (T≤{}, q≤{})  cycle {}/{}  lr {:.1e}  L {:.4}  train {:>5.1}%  val {:>5.1}% ±{:.1}{}  |g| {:.3}  plaf {:.0}%  énergie {}  {:.0} éch/s  {:.0} s",
                 step,
                 stage + 1,
                 nst,
@@ -252,6 +294,8 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
                 100.0 * v.ci(),
                 if cyc_end { " [porte]" } else { "" },
                 gsum / gcnt.max(1) as f64,
+                100.0 * cap_c as f64 / cap_t.max(1) as f64,
+                top.join(" "),
                 done as f64 / el.max(1e-9),
                 el
             );
@@ -262,6 +306,11 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
             gsum = 0.0;
             gcnt = 0;
             bad = 0;
+            cap_t = 0;
+            cap_c = 0;
+            for x in gq.iter_mut() {
+                *x = 0.0;
+            }
             checkpoint(&net, &cfg.out, pr);
             if cyc_end {
                 let is_final = stage + 1 == nst;
@@ -271,6 +320,8 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
                         why = "étage final maîtrisé";
                         break;
                     }
+                    // extrapolation d'un étage : poids de fin d'étage sur la plage suivante, avant toute mise à jour
+                    let zs = validate(&net, &sts[stage + 1], cfg.n_gate, &mut vrng, &mut vws);
                     println!(
                         "  ↑ porte franchie ({:.1}% ≥ {:.0}%) → étage {}/{} : T ≤ {}, qmax ≤ {}",
                         100.0 * v.fid(),
@@ -279,6 +330,12 @@ pub fn train(cfg: &Cfg) -> (Net, Prior) {
                         nst,
                         sts[stage + 1].t_hi,
                         sts[stage + 1].q_hi
+                    );
+                    println!(
+                        "    zéro-coup (poids de fin d'étage sur la plage suivante) : fid {:.1}% ±{:.1} (n = {})",
+                        100.0 * zs.fid(),
+                        100.0 * zs.ci(),
+                        zs.n
                     );
                     stage += 1;
                     cyc = 0;
