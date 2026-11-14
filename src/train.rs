@@ -13,6 +13,7 @@
 use crate::eval::{draw_world, in_part, nontrivial, validate, Agg, Part};
 use crate::meta::{mutate_sample, Prior, Sample};
 use crate::net::{Adam, Net, Work};
+use crate::tape::{Adam, Net, Work};
 use crate::rng::Rng;
 use std::time::Instant;
 
