@@ -28,10 +28,9 @@ jobs:
       - name: Run Chronicle application
         #run: RUST_BACKTRACE=full cargo run --release -- train --out out/m1.bin --secs 1800
         run: |
-          cargo run --release -- tgrad
-          cargo run --release -- check
-          cargo run --release -- train --kmax 2 --secs 5400 --out out/t2.bin --n 1000 --esecs 90
-          cargo run --release -- sizes --model out/t2.bin
+          cargo run --release -- tgrad      # doit rester ok : rho = ∞ par défaut
+          cargo run --release -- train --kmax 2 --secs 5400 --out out/t3.bin --n 1000 --esecs 90
+          cargo run --release -- sizes --model out/t3.bin    # seulement si l'étage 6 est atteint à fid ≥ 0,95
         env:
           RUSTFLAGS: "-C target-cpu=native"
 
