@@ -171,6 +171,9 @@ fn cmd_train(a: &[String]) {
         fixed,
         out: opt(a, "--out", "m0d.bin".to_string()),
         init: opt(a, "--init", String::new()),
+        lr_stage: opt(a, "--lrstage", 5e-4f64),
+        warm: opt(a, "--warm", 300usize),
+        rho: opt(a, "--rho", 1.2f64),
     };
     let (net, pr) = train::train(&cfg);
     println!("modèle : {} (plage : T ≤ {}, qmax ≤ {}, k ≤ {})\n", cfg.out, pr.t_hi, pr.q_hi, pr.k_max);
