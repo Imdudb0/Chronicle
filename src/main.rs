@@ -207,6 +207,8 @@ fn cmd_train(a: &[String]) {
         from: opt(a, "--from", 1usize).saturating_sub(1),
         kmin: opt(a, "--kmin", 1usize).clamp(1, K_MAX),
         pool: opt(a, "--pool", 26usize).clamp(K_MAX, 256),
+        qtop: opt(a, "--qtop", d.q_hi),
+        frontier: a.iter().any(|x| x.as_str() == "--frontier"),
         kmax: opt(a, "--kmax", d.k_max).clamp(1, K_MAX),
         fixed,
         out: opt(a, "--out", "m0d.bin".to_string()),
